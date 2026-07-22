@@ -1,0 +1,5 @@
+# protoc/grpc_cpp_plugin çıktısı (proto/tracking.proto -> buraya üretilir).
+# Board üzerinde `protoc` ile üretilir, repoya commit edilmez.
+*
+!.gitkeep
+!.gitignore

@@ -1,0 +1,6 @@
+# protoc --python_out/--grpc_python_out ciktisi (tracking-app/proto/tracking.proto
+# -> buraya uretilir, bkz. app/grpc_main.py basindaki komut). Host makinede
+# uretilir, repoya commit edilmez.
+*
+!.gitkeep
+!.gitignore

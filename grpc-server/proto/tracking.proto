@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+package drone.object_tracking;
+
+import "google/protobuf/empty.proto";
+
+service DroneObjectTrackingService {
+  rpc SendBoundingBox(BBox) returns (BoundingBoxAck);
+  rpc Stream(google.protobuf.Empty) returns (stream BBox);
+}
+
+// Alan seti M10'daki custom MAVLink msg::BBOX ile birebir aynı —
+// confidence/class_id/timestamp yok.
+message BBox {
+  float x = 1;
+  float y = 2;
+  float w = 3;
+  float h = 4;
+}
+
+message BoundingBoxAck {
+  bool success = 1;
+  string message = 2;
+}

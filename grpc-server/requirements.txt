@@ -1,0 +1,10 @@
+# mavlink-server (GCS host uygulaması) bağımlılıkları -- bu makine board'dan
+# AYRI, kendi Python ortamına sahip olmalı (venv önerilir, bkz. README.md).
+#
+# grpc_main.py (M11, TCP/gRPC simülasyonu) için:
+grpcio==1.62.2
+grpcio-tools==1.62.2
+opencv-python==4.9.0.80
+
+# app/main.py (Faz 2, UART+UDP/MAVLINK referans uygulaması) için ek olarak:
+pyserial==3.5

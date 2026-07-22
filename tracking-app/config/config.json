@@ -1,0 +1,125 @@
+{
+  "version": "1.0",
+  "description": "LightTrack RK3588 - Konfigürasyon Parametreleri",
+  
+  "tracking_parameters": {
+    "stride": {
+      "value": 16,
+      "type": "int",
+      "description": "Her özellik hücresinin piksel karşılığı. NPU çıktı grid'inin gerçek piksel koordinatlarına dönüşüm adım boyutu."
+    },
+    "penalty_k": {
+      "value": 0.007,
+      "type": "float",
+      "description": "Boyut cezası katsayısı. Beklenmedik boyut değişikliklerini cezalandırır. Yüksek değer = daha stabil boyut. LightTrack orijinalinde 'penalty_tk' olarak geçer, NanoTrack'e göre çok daha küçüktür (0.138 → 0.007) çünkü LightTrack'in bbox regresyon çıktısı farklı ölçekte davranır."
+    },
+    "window_influence": {
+      "value": 0.225,
+      "type": "float",
+      "description": "Hanning penceresi etkisi. Önceki konuma yakın skorları tercih eder, titremeyi azaltır. 0=sadece skor, 1=sadece pencere."
+    },
+    "lr": {
+      "value": 0.616,
+      "type": "float",
+      "description": "Öğrenme oranı (learning rate). Geçmiş konum ile yeni tahmin arasındaki yumuşak geçiş hızı. 0=sabit, 1=tamamen yeni. LightTrack NanoTrack'e göre yeni tahmine daha fazla ağırlık verir (0.348 → 0.616)."
+    },
+    "exemplar_size": {
+      "value": 127,
+      "type": "int",
+      "description": "Template (şablon) giriş boyutu. İlk kareden crop edilen nesne bu boyuta resize edilir. T (init) modeli girişi. NanoTrack ile aynı."
+    },
+    "instance_size": {
+      "value": 288,
+      "type": "int",
+      "description": "Arama alanı (search region) boyutu. Her karede nesnenin etrafından crop edilen geniş alan. X (backbone) modeli girişi. LightTrack mimarisi 255 yerine 288 kullanır."
+    },
+    "score_size": {
+      "value": 18,
+      "type": "int",
+      "description": "Skor haritası boyutu. H (neck_head) modeli çıktısında 18x18 grid = 324 olası konum. round(288/16) = 18."
+    },
+    "context_amount": {
+      "value": 0.5,
+      "type": "float",
+      "description": "Arama alanı bağlam oranı. Nesnenin etrafına eklenen boşluk. 0.5 = nesne boyutunun %50'si kadar çevreye eklenecek. NanoTrack ile aynı."
+    },
+    "total_stride": {
+      "value": 16,
+      "type": "int",
+      "description": "Toplam stride. Grid koordinatlarını piksele çevirmede kullanılır (grid_index * total_stride). instance_size (288) ile score_size (18) arasındaki ilişkiyi belirler: 288/16=18."
+    },
+    "windowing": {
+      "value": "cosine",
+      "type": "string",
+      "description": "Pencere fonksiyonu tipi. Cosine (Hanning) penceresi, uzaktaki konumlara ceza uygular."
+    },
+    "lost_score_threshold": {
+      "value": 0.3,
+      "type": "float",
+      "description": "Kayip hedef guvenlik agi esigi. cls_score_max bu degerin altina duserse, tracker target_sz'i son guvenilir boyuta sabitler (pozisyona dokunmaz). Amac: drift sirasinda bbox'un sinirsizca buyumesini, dolayisiyla arama alaninin (ve get_subwindow_tracking icindeki copyMakeBorder CPU maliyetinin) buyumesini engellemek."
+    }
+  },
+  
+  "video_parameters": {
+    "frame_delay_ms": {
+      "value": 0,
+      "type": "int",
+      "description": "Her kare arasındaki bekleme süresi (ms). 0 = bekleme yok, maksimum hız. Video FPS'ye göre ayarlanır."
+    },
+    "console_log_interval": {
+      "value": 30,
+      "type": "int",
+      "description": "Console'a her kaç karede bir bilgi yazılır. FPS, score, frame sayısı gösterilir."
+    }
+  },
+  
+  "bounding_box_parameters": {
+    "min_bbox_size": {
+      "value": 10,
+      "type": "int",
+      "description": "Minimum bounding box boyutu (px). Küçük değerler stabilize edilir."
+    },
+    "score_green_threshold": {
+      "value": 0.7,
+      "type": "float",
+      "description": "Score > 0.7 → Yeşil kutu (güvenilir takip)"
+    },
+    "score_orange_threshold": {
+      "value": 0.4,
+      "type": "float",
+      "description": "Score > 0.4 → Turuncu kutu (orta güvenilirlik)"
+    },
+    "score_red_threshold": {
+      "value": 0.4,
+      "type": "float",
+      "description": "Score <= 0.4 → Kırmızı kutu (düşük güvenilirlik, nesne kaybolmuş olabilir). LightTrack'in cls_score dağılımı NanoTrack'ten farklı olabileceğinden, ilk testlerden sonra bu eşikleri gözlemlenen skorlara göre yeniden ayarlamanız önerilir."
+    }
+  },
+  
+  "model_paths": {
+    "template_model": "models/lighttrack_init_fp16.rknn",
+    "search_model": "models/lighttrack_backbone_fp16.rknn",
+    "head_model": "models/lighttrack_neck_head_fp16.rknn"
+  },
+  
+  "input_parameters": {
+    "video_path": {
+      "required": true,
+      "example": "videos/girl_dance.mp4",
+      "description": "Takip edilecek video dosya yolu"
+    },
+    "bbox": {
+      "required_for": "headless mode",
+      "format": "x,y,width,height",
+      "example": "233,152,109,222",
+      "description": "İlk karedeki hedef nesnenin bounding box koordinatları (sol_x, sol_y, genislik, yukseklik)"
+    }
+  },
+  
+  "usage_examples": {
+    "interactive": "./build/lighttrack_test videos/girl_dance.mp4",
+    "interactive_save": "./build/lighttrack_test videos/girl_dance.mp4 --save",
+    "headless": "./build/lighttrack_test videos/girl_dance.mp4 --headless --bbox 233,152,109,222",
+    "headless_save": "./build/lighttrack_test videos/girl_dance.mp4 --headless --bbox 233,152,109,222 --save -o result.avi"
+  }
+}
