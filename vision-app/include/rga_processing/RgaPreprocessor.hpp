@@ -7,6 +7,9 @@
 #include <memory>
 #include <string>
 
+// RGA katmanina ozgu piksel format enum (referans tracking-app ile ayni)
+enum class RgaPixelFormat { NV12, NV16, RGB888, BGR888 };
+
 class RgaPreprocessor {
 public:
     RgaPreprocessor();
@@ -51,6 +54,12 @@ public:
     // RGA ciktisi icin havuzdan buffer tahsisi (DMA fd ile)
     DmaBufferPtr acquireOutputBuffer(uint32_t bytes, uint32_t w, uint32_t h,
                                       PixelFormat px_fmt);
+
+    // Kaynak buffer'in tamamen ayri bir kopyasini olusturur.
+    // Decoder buffer'ina yerinde yazma (çizim vb.) onlemek icin kullanilir.
+    // pikselkaymasi.md §3 Adimlar ile uyumlu implementasyon.
+    bool cloneFrame(const DmaBufferPtr& source, RgaPixelFormat source_format,
+                    DmaBufferPtr& out_buffer);
 
 private:
     struct Impl;

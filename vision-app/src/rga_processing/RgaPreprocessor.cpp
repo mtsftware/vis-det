@@ -48,6 +48,33 @@ static uint32_t align16(uint32_t v) {
     return ((v + 15) / 16) * 16;
 }
 
+static int toRgaFormat(RgaPixelFormat fmt) {
+    switch (fmt) {
+        case RgaPixelFormat::NV12:
+            return RK_FORMAT_YCbCr_420_SP;
+        case RgaPixelFormat::NV16:
+            return RK_FORMAT_YCbCr_422_SP;
+        case RgaPixelFormat::RGB888:
+            return RK_FORMAT_RGB_888;
+        case RgaPixelFormat::BGR888:
+            return RK_FORMAT_BGR_888;
+    }
+    return RK_FORMAT_YCbCr_420_SP;
+}
+
+static size_t formatByteSize(RgaPixelFormat fmt, uint32_t w, uint32_t h) {
+    switch (fmt) {
+        case RgaPixelFormat::NV12:
+            return static_cast<size_t>(w) * h * 3 / 2;
+        case RgaPixelFormat::NV16:
+            return static_cast<size_t>(w) * h * 2;
+        case RgaPixelFormat::RGB888:
+        case RgaPixelFormat::BGR888:
+            return static_cast<size_t>(w) * h * 3;
+    }
+    return static_cast<size_t>(w) * h * 3 / 2;
+}
+
 }  // namespace
 
 bool RgaPreprocessor::nv12ToRgb888(const DmaBufferPtr& src_nv12, uint32_t src_w,
@@ -218,6 +245,62 @@ bool RgaPreprocessor::processRgb888ToYuv(const DmaBufferPtr& src_rgb, uint32_t s
     std::cout << "[RgaPreprocessor] RGB888->" << fmt_name
               << " donusum tamamlandi: " << src_w << "x" << src_h
               << " -> " << dst_w << "x" << dst_h << "\n";
+    return true;
+}
+
+bool RgaPreprocessor::cloneFrame(const DmaBufferPtr& source, RgaPixelFormat source_format,
+                                  DmaBufferPtr& out_buffer) {
+    // pikselkaymasi.md §3 Adim 1: Ön koşul kontrolü
+    if (!source || source->fd < 0) {
+        return false;
+    }
+
+    uint32_t w = source->width;
+    uint32_t h = source->height;
+
+    // pikselkaymasi.md §3 Adim 2: Boyut/format belirle, byte hesapla
+    // Hedef her zaman SIKI-PAKETLI (w_stride=w, h_stride=h) — dolgu payi yok
+    size_t bytes = formatByteSize(source_format, w, h);
+    PixelFormat px = (source_format == RgaPixelFormat::NV16) ? PixelFormat::NV16
+                                                              : PixelFormat::NV12;
+
+    // pikselkaymasi.md §3 Adim 3: Havuzdan buffer al
+    DmaBufferPtr buf = impl_->acquireBuffer("frame-clone-", static_cast<uint32_t>(bytes), w, h, px);
+    if (!buf) {
+        return false;
+    }
+
+    // pikselkaymasi.md §3 Adim 4: RGA wrapper'larini hazirla
+    // Kaynak: gerçek stride ile, Hedef: tightly-packed (stride argümani verilmez)
+    int rga_fmt = toRgaFormat(source_format);
+    rga_buffer_t src_buf = wrapbuffer_fd(source->fd, static_cast<int>(w),
+                                          static_cast<int>(h), rga_fmt,
+                                          static_cast<int>(source->w_stride),
+                                          static_cast<int>(source->h_stride));
+    rga_buffer_t dst_buf =
+        wrapbuffer_fd(buf->fd, static_cast<int>(w), static_cast<int>(h), rga_fmt);
+
+    // pikselkaymasi.md §3 Adim 5: imcheck ile dogrulama, sonra improcess ile kopyala
+    im_rect rect = {0, 0, static_cast<int>(w), static_cast<int>(h)};
+    IM_STATUS check_ret = imcheck(src_buf, dst_buf, rect, rect);
+    if (check_ret != IM_STATUS_NOERROR) {
+        std::cerr << "[RgaPreprocessor] cloneFrame imcheck basarisiz: "
+                  << imStrError(check_ret) << "\n";
+        return false;
+    }
+
+    rga_buffer_t empty_pat{};
+    im_rect empty_rect{};
+    IM_STATUS proc_ret = improcess(src_buf, dst_buf, empty_pat, rect, rect, empty_rect, 0);
+    if (proc_ret != IM_STATUS_SUCCESS) {
+        std::cerr << "[RgaPreprocessor] cloneFrame improcess basarisiz: "
+                  << imStrError(proc_ret) << "\n";
+        return false;
+    }
+
+    // pikselkaymasi.md §3 Adim 6: Cache senkronizasyonu, sonucu döndür
+    impl_->pool.syncCpuReadBegin(buf);
+    out_buffer = buf;
     return true;
 }
 
