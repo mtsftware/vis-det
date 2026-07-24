@@ -182,6 +182,91 @@ bool RgaPreprocessor::draw3DummyBboxes(DmaBufferPtr& rgb_buffer, uint32_t w, uin
     return true;
 }
 
+bool RgaPreprocessor::drawDetectedObjects(DmaBufferPtr& rgb_buffer, uint32_t w, uint32_t h,
+                                           const std::vector<TrackableObject>& objects,
+                                           int line_thickness, bool draw_id_label) {
+    if (!rgb_buffer || rgb_buffer->fd < 0 || objects.empty()) return true;
+
+    int rga_fmt = RK_FORMAT_RGB_888;
+    uint32_t stride = align16(w);
+
+    rga_buffer_t img_buf = wrapbuffer_fd(rgb_buffer->fd, static_cast<int>(w),
+                                          static_cast<int>(h), rga_fmt,
+                                          static_cast<int>(stride), static_cast<int>(h));
+
+    int count = 0;
+    for (const auto& obj : objects) {
+        if (!obj.active && obj.lost_count > 0) continue;  // tamamen silinmiþ
+
+        // Tek-class model: Tüm tespitler class 0 → yeþil renk
+        // RGA RGB888 formatinda: (B<<16)|(G<<8)|R
+        // Yeþil (RGB: 0,255,0) → (0<<16)|(255<<8)|0
+        int color = (0 << 16) | (255 << 8) | 0;
+
+        // Kaybolmuþ obje için translucent efekt: daha ince çizgi
+        int lt = line_thickness;
+        if (obj.lost_count > 0) {
+            lt = std::max(1, line_thickness - 1);
+            // Kaybolmuþ obje için sarý renk
+            color = (0 << 16) | (255 << 8) | 255;
+        }
+
+        float x = obj.detection.x;
+        float y = obj.detection.y;
+        float bw = obj.detection.width;
+        float bh = obj.detection.height;
+
+        // Üst kenar
+        im_rect top_rect = {static_cast<int>(x), static_cast<int>(y),
+                           static_cast<int>(bw), lt};
+        imfill(img_buf, top_rect, color);
+
+        // Alt kenar
+        im_rect bottom_rect = {static_cast<int>(x), static_cast<int>(y + bh - lt),
+                               static_cast<int>(bw), lt};
+        imfill(img_buf, bottom_rect, color);
+
+        // Sol kenar
+        im_rect left_rect = {static_cast<int>(x), static_cast<int>(y),
+                             lt, static_cast<int>(bh)};
+        imfill(img_buf, left_rect, color);
+
+        // Sað kenar
+        im_rect right_rect = {static_cast<int>(x + bw - lt), static_cast<int>(y),
+                              lt, static_cast<int>(bh)};
+        imfill(img_buf, right_rect, color);
+
+        // ID label: bbox üstüne küçük dikdörtgen + metin efekti
+        if (draw_id_label) {
+            // Label arka plan (dolu dikdörtgen)
+            int label_w = 50;
+            int label_h = 16;
+            int label_x = static_cast<int>(x);
+            int label_y = static_cast<int>(y) - label_h;
+            if (label_y < 0) label_y = static_cast<int>(y);
+
+            // Label arka plan - dolu dikdörtgen (renkli)
+            im_rect label_bg = {label_x, label_y, label_w, label_h};
+            imfill(img_buf, label_bg, color);
+
+            // Label sýrý
+            im_rect label_border = {label_x, label_y, label_w, 1};
+            imfill(img_buf, label_border, (255 << 16) | (255 << 8) | 255);
+            im_rect label_border_b = {label_x, label_y + label_h - 1, label_w, 1};
+            imfill(img_buf, label_border_b, (255 << 16) | (255 << 8) | 255);
+            im_rect label_border_l = {label_x, label_y, 1, label_h};
+            imfill(img_buf, label_border_l, (255 << 16) | (255 << 8) | 255);
+            im_rect label_border_r = {label_x + label_w - 1, label_y, 1, label_h};
+            imfill(img_buf, label_border_r, (255 << 16) | (255 << 8) | 255);
+        }
+
+        count++;
+    }
+
+    std::cout << "[RgaPreprocessor] " << count << " adet object çizildi.\n";
+    return true;
+}
+
 bool RgaPreprocessor::rgb888ToNv12(const DmaBufferPtr& src_rgb, uint32_t src_w,
                                     uint32_t src_h, DmaBufferPtr& dst_nv12,
                                     uint32_t dst_w, uint32_t dst_h) {

@@ -2,10 +2,12 @@
 
 #include "buffer/DmaBufferPool.hpp"
 #include "types/DmaBuffer.hpp"
+#include "tracking/MultiObjectTracker.hpp"
 
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 // RGA katmanina ozgu piksel format enum (referans tracking-app ile ayni)
 enum class RgaPixelFormat { NV12, NV16, RGB888, BGR888 };
@@ -33,6 +35,15 @@ public:
 
     // RGB888 buffer uzerine 3 adet dummy BBox cizer (kirmizi/yesil/mavi).
     bool draw3DummyBboxes(DmaBufferPtr& rgb_buffer, uint32_t w, uint32_t h);
+
+    // Tespit edilen object'leri class-bazli renklerle cizer + ID etiketi ekler.
+    // renkler: insan=yeþil(0,255,0), araç=mavi(255,0,0) varsayýlýr.
+    // line_thickness: çizgi kalýnlýðý (piksel).
+    // draw_id_label: true ise bbox üzerine ID yaz (basit text rectangle).
+    bool drawDetectedObjects(DmaBufferPtr& rgb_buffer, uint32_t w, uint32_t h,
+                             const std::vector<TrackableObject>& objects,
+                             int line_thickness = 2,
+                             bool draw_id_label = true);
 
     // RGB888 -> NV12 dönüşüm + resize (encoder icin geri çevrim)
     bool rgb888ToNv12(const DmaBufferPtr& src_rgb, uint32_t src_w, uint32_t src_h,
