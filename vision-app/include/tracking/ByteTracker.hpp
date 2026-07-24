@@ -37,6 +37,12 @@ constexpr float kUnconfirmedMatchThresh = 0.7f;  // onaylanmamis (henuz aktive o
 constexpr float kDuplicateIouThresh = 0.15f;     // remove_duplicate_stracks esigi (dist < bu -> duplicate)
 }  // namespace ByteTrackConfig
 
+// STrack yasam dongusu durumu — referans: bytetracker_fix.py TrackState
+// (IntEnum). ByteTracker.cpp'deki STrack bunu kullanir; ByteTracker::update()
+// disina hic sizmaz (TrackedBox'ta yer almaz) ama .cpp'nin state'i
+// kullanabilmesi icin burada (public header'da) tanimli olmasi gerekiyor.
+enum class TrackState { New, Tracked, Lost, Removed };
+
 struct TrackedBox {
     int track_id = -1;
     float x = 0;       // top-left x (Kalman-tahminli, orijinal frame piksel uzayi)
