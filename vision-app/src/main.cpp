@@ -2,6 +2,9 @@
 #include "decode/MppDecoder.hpp"
 #include "streaming/RtspStreamer.hpp"
 #include "rga_processing/RgaPreprocessor.hpp"
+#include "inference/YoloInferenceEngine.hpp"
+#include "postprocess/YoloPostProcessor.hpp"
+#include "tracking/MultiObjectTracker.hpp"
 #include "types/DmaBuffer.hpp"
 #include "types/VideoCoding.hpp"
 
@@ -11,6 +14,8 @@
 #include <atomic>
 #include <string>
 #include <thread>
+#include <vector>
+#include <memory>
 
 static std::atomic<bool> g_running{true};
 static std::mutex g_frame_mutex;
@@ -26,7 +31,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "============================================================\n";
-    std::cout << "  MyApp - Phase 4: RGA On Isleme Pipeline (Renkli DMA)\n";
+    std::cout << "  Vision App - YOLOv8n + Multi-Object Tracking Pipeline\n";
     std::cout << "============================================================\n";
     std::cout << "RTSP Kaynak : " << rtsp_url << "\n";
     std::cout << "Yayin URL   : rtsp://<board-ip>:8554/live\n";
@@ -35,11 +40,30 @@ int main(int argc, char* argv[]) {
     signal(SIGINT, signalHandler);
     signal(SIGTERM, signalHandler);
 
-    const uint32_t target_w = 640;
-    const uint32_t target_h = 640;
+    const uint32_t model_w = 640;
+    const uint32_t model_h = 640;
     const uint32_t fps = 30;
 
-    // 1. RTSP Demuxer baslat
+    // ==================== YOLO INFERENCE KURULUMU ====================
+    std::string model_path = "models/best-rk3588.rknn";
+
+    YoloInferenceEngine yolo_engine;
+    if (!yolo_engine.loadModel(model_path)) {
+        std::cerr << "[main] YOLO modeli yuklenemedi: " << model_path << "\n";
+        return 1;
+    }
+    std::cout << "[main] YOLOv8n NPU modeli yuklendi.\n";
+
+    // Tracker kurulumu
+    MultiObjectTracker tracker;
+    MultiObjectTracker::Config tcfg;
+    tcfg.iou_thresh = 0.4f;
+    tcfg.max_lost_frames = 10;
+    tracker.setConfig(tcfg);
+    std::cout << "[main] Multi-Object Tracker kuruldu.\n";
+
+    // ==================== RTSP PIPELINE KURULUMU ====================
+
     RtspDemuxer demuxer(rtsp_url, 5000);
     if (!demuxer.start()) {
         std::cerr << "[main] Demuxer baslatilamadi!\n";
@@ -47,7 +71,6 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "[main] Demuxer basarili.\n";
 
-    // 2. MPP Decoder baslat
     MppDecoder decoder(VideoCoding::H264);
     if (!decoder.start()) {
         std::cerr << "[main] Decoder baslatilamadi!\n";
@@ -60,7 +83,6 @@ int main(int argc, char* argv[]) {
     PixelFormat detected_format = PixelFormat::Unknown;
     std::atomic<int> frame_count{0};
 
-    // 3. RTSP Streamer baslat — orijinal boyutlarla (format sonradan ayarlanacak)
     RtspStreamer streamer(8554, "/live", original_width, original_height, fps);
     if (!streamer.start()) {
         std::cerr << "[main] Streamer baslatilamadi!\n";
@@ -68,151 +90,198 @@ int main(int argc, char* argv[]) {
     }
     std::cout << "[main] Streamer basarili (NV12/NV16).\n";
 
-    // 4. RgaPreprocessor olustur
     RgaPreprocessor rga;
 
-    // Frame callback: decode edilen frame'i isle
+    // Helper: align16
+    auto align16 = [](uint32_t v) { return ((v + 15) / 16) * 16; };
+
+    // ==================== FRAME ISLEME CALLBACK ====================
     decoder.setFrameCallback([&](DmaBufferPtr decoded_frame) {
         if (!g_running.load()) return;
         if (!decoded_frame || !decoded_frame->virt_addr) return;
 
         int cnt = frame_count.fetch_add(1);
 
-        // Format tespitini ilk frame'de yap
+        // İlk frame'de format ve boyut tespit et
         if (cnt == 0) {
             original_width = decoded_frame->width;
             original_height = decoded_frame->height;
-
-            // Decoder DmaBuffer zaten format alanını doldurdu:
-            // buf->format = (base_fmt == MPP_FMT_YUV422SP) ? PixelFormat::NV16
-            //                                              : PixelFormat::NV12;
             detected_format = decoded_frame->format;
-
-            // Streameri gerçek frame boyutlarıyla güncelle
             streamer.setDimensions(original_width, original_height);
 
             std::cout << "[main] Orijinal boyutlar: "
                       << original_width << "x" << original_height << "\n";
-            std::cout << "[main] Tespit edilen format: ";
-            if (detected_format == PixelFormat::NV16) {
-                std::cout << "NV16\n";
-                std::cout << "[main] ====> RGA NV16->RGB888 + Stream NV16 kullanacak\n";
-            } else {
-                std::cout << "NV12\n";
-                std::cout << "[main] ====> RGA NV12->RGB888 + Stream NV12 kullanacak\n";
-            }
+            std::cout << "[main] Format: "
+                      << (detected_format == PixelFormat::NV16 ? "NV16" : "NV12") << "\n";
         }
 
         std::lock_guard<std::mutex> lock(g_frame_mutex);
 
         // ================================================================
-        // ADIM 1: YUV (NV12 veya NV16) -> 640x640 RGB888 (RGA)
+        // ADIM 1: Decode cikti → RGA ile 640x640 RGB (inference icin)
         // ================================================================
-        size_t rgb640_size = static_cast<size_t>(target_w) * target_h * 3;
-        DmaBufferPtr rgb640 = rga.acquireOutputBuffer(
-            rgb640_size, target_w, target_h, PixelFormat::RGB888);
-        if (!rgb640) {
-            std::cerr << "[main] RGB640 DMA buffer tahsisi basarisiz.\n";
+        size_t rgb_model_size = static_cast<size_t>(model_w) * model_h * 3;
+        DmaBufferPtr rgb_model = rga.acquireOutputBuffer(
+            rgb_model_size, model_w, model_h, PixelFormat::RGB888);
+        if (!rgb_model) {
+            std::cerr << "[main] RGB model buffer tahsisi basarisiz.\n";
             return;
         }
 
         bool converted;
         if (detected_format == PixelFormat::NV16) {
             converted = rga.nv16ToRgb888(decoded_frame, original_width, original_height,
-                                          rgb640, target_w, target_h);
+                                         rgb_model, model_w, model_h);
         } else {
             converted = rga.nv12ToRgb888(decoded_frame, original_width, original_height,
-                                          rgb640, target_w, target_h);
+                                         rgb_model, model_w, model_h);
         }
-
         if (!converted) {
-            std::cerr << "[main] YUV->RGB888 donusum basarisiz (fmt="
-                      << (detected_format == PixelFormat::NV16 ? "NV16" : "NV12") << ").\n";
+            std::cerr << "[main] YUV->RGB donusum basarisiz.\n";
             return;
         }
 
         // ================================================================
-        // ADIM 2: 640x640 RGB'yi PPM olarak kaydet (renkli dogrulama)
+        // ADIM 2: YOLO INFERENCE (NPU)
         // ================================================================
-        if (cnt < 10 && cnt % 5 == 0) {
-            std::string ppm_path = "/tmp/ph4_frame_rgb640_" + std::to_string(cnt) + ".ppm";
-            RgaPreprocessor::saveRgb888ToPpm(rgb640, ppm_path, target_w, target_h);
+        uint32_t input_size = static_cast<uint32_t>(rgb_model->size);
+        if (!yolo_engine.run(rgb_model->virt_addr, input_size)) {
+            std::cerr << "[main] YOLO inference basarisiz.\n";
+            return;
         }
 
         // ================================================================
-        // ADIM 3: RGB uzerine 3 adet dummy BBox ciz (RGA ile)
+        // ADIM 3: OUTPUT DECODE + NMS
         // ================================================================
-        bool bbox_drawn = rga.draw3DummyBboxes(rgb640, target_w, target_h);
-        if (!bbox_drawn) {
-            std::cerr << "[main] BBox cizimi basarisiz.\n";
+        const void* raw_output = nullptr;
+        uint32_t output_size = 0;
+        if (!yolo_engine.getOutput(raw_output, output_size)) {
+            std::cerr << "[main] YOLO output alinamadi.\n";
+            yolo_engine.releaseOutputs();
+            return;
+        }
+
+        std::vector<YoloDetection> detections;
+        
+        // Debug: output bilgisi
+        std::cout << "[main] Output size: " << output_size 
+                  << " bytes, raw_output: " << (raw_output ? "valid" : "NULL") << "\n";
+        
+        // Threshold geçici olarak 0.1'e düşürüldü (test amaçlı — model çok düşük skor veriyor olabilir)
+        const float detection_conf_thresh = 0.1f;
+        
+        YoloPostProcessor::decodeOutputs(
+            raw_output, output_size,
+            original_width, original_height,
+            model_w, model_h,
+            detection_conf_thresh, detections);
+
+        std::cout << "[main] decodeOutputs sonra: " << detections.size() << " detection.\n";
+
+        if (!detections.empty()) {
+            detections = YoloPostProcessor::applyNMS(detections, 0.45f);
+        }
+        yolo_engine.releaseOutputs();
+
+        if (cnt % 30 == 0) {
+            std::cout << "[main] Frame " << cnt << ": " << detections.size()
+                      << " adet tespit.\n";
         }
 
         // ================================================================
-        // ADIM 4: BBox'li RGB'yi PPM olarak kaydet (dogrulama)
+        // ADIM 4: MULTI-OBJECT TRACKING
         // ================================================================
-        if (cnt < 3) {
-            std::string bbox_ppm_path = "/tmp/ph4_frame_bbox_rgb640_" + std::to_string(cnt) + ".ppm";
-            RgaPreprocessor::saveRgb888ToPpm(rgb640, bbox_ppm_path, target_w, target_h);
+        auto tracked_objects = tracker.update(detections, cnt);
+
+        if (cnt % 30 == 0) {
+            std::cout << "[main]  Aktif track: " << tracked_objects.size()
+                      << " (toplam: " << tracker.totalTracked()
+                      << ", kaybolan: " << tracker.lostCount() << ")\n";
         }
 
         // ================================================================
-        // ADIM 5: RGB888 (640x640) -> YUV (orijinal boyut, tespit edilen formatla)
+        // ADIM 5: Islenmis frame olustur (clone → RGB → draw → NV12)
         // ================================================================
-        // Rockchip RGA/MPP: width ve height 16'ya hizalanmalidir (chroma padding)
-        auto align16 = [](uint32_t v) { return ((v + 15) / 16) * 16; };
-        uint32_t aligned_w = align16(original_width);
-        uint32_t aligned_h = align16(original_height);
+        // Decoder cikti sınırlı havuzdan geliyor — yerinde çizim yapmayýÝ BIR.
+        // Ayri bir kopya olustur.
+        DmaBufferPtr working_copy;
+        if (!rga.cloneFrame(decoded_frame,
+                            (detected_format == PixelFormat::NV16) ? RgaPixelFormat::NV16
+                                                                    : RgaPixelFormat::NV12,
+                            working_copy)) {
+            std::cerr << "[main] Frame clone basarisiz.\n";
+            return;
+        }
 
-        size_t yuv_orig_size;
-        PixelFormat out_fmt = detected_format;
-        if (out_fmt == PixelFormat::NV16) {
-            // NV16: 2 byte/pixel (YUV 4:2:2)
-            yuv_orig_size = static_cast<size_t>(aligned_w) * aligned_h * 2;
+        // Working copy'i RGB'ye çevir (çizim için)
+        uint32_t orig_aligned_w = align16(original_width);
+        uint32_t orig_aligned_h = align16(original_height);
+        size_t yuv_size;
+        if (detected_format == PixelFormat::NV16) {
+            yuv_size = static_cast<size_t>(orig_aligned_w) * orig_aligned_h * 2;
         } else {
-            // NV12: 1.5 byte/pixel (YUV 4:2:0)
-            yuv_orig_size = static_cast<size_t>(aligned_w) * aligned_h * 3 / 2;
+            yuv_size = static_cast<size_t>(orig_aligned_w) * orig_aligned_h * 3 / 2;
         }
 
-        DmaBufferPtr yuv_processed = rga.acquireOutputBuffer(
-            yuv_orig_size, aligned_w, aligned_h, out_fmt);
-        if (!yuv_processed) {
-            std::cerr << "[main] Output YUV DMA buffer tahsisi basarisiz.\n";
-            return;
-        }
+        DmaBufferPtr rgb_work = rga.acquireOutputBuffer(
+            static_cast<uint32_t>(yuv_size), orig_aligned_w, orig_aligned_h,
+            (detected_format == PixelFormat::NV16) ? PixelFormat::NV16 : PixelFormat::NV12);
 
-        bool back_converted;
-        if (out_fmt == PixelFormat::NV16) {
-            back_converted = rga.rgb888ToNv16(rgb640, target_w, target_h,
-                                               yuv_processed, aligned_w, aligned_h);
+        // Working NV12 → RGB (büyük boyutta)
+        DmaBufferPtr rgb_large = rga.acquireOutputBuffer(
+            static_cast<uint32_t>(orig_aligned_w * orig_aligned_h * 3),
+            orig_aligned_w, orig_aligned_h, PixelFormat::RGB888);
+
+        bool ok;
+        if (detected_format == PixelFormat::NV16) {
+            ok = rga.nv16ToRgb888(working_copy, orig_aligned_w, orig_aligned_h,
+                                  rgb_large, orig_aligned_w, orig_aligned_h);
         } else {
-            back_converted = rga.rgb888ToNv12(rgb640, target_w, target_h,
-                                               yuv_processed, aligned_w, aligned_h);
+            ok = rga.nv12ToRgb888(working_copy, orig_aligned_w, orig_aligned_h,
+                                  rgb_large, orig_aligned_w, orig_aligned_h);
         }
 
-        if (!back_converted) {
-            std::cerr << "[main] RGB888->YUV geri donusum basarisiz.\n";
-            return;
-        }
+        if (ok) {
+            // Tespit edilen object'leri çiz
+            if (!tracked_objects.empty()) {
+                rga.drawDetectedObjects(rgb_large, orig_aligned_w, orig_aligned_h,
+                                       tracked_objects, 2, true);
+            }
 
-        // ================================================================
-        // ADIM 6: Islenmis YUV frame'i stream'e gonder (color.md §5a ile uyumlu)
-        // mpph264enc her zaman NV12 bekler — pushFrame() otomatik NV16→NV12 downsample yapar
-        // ================================================================
-        streamer.pushFrame(yuv_processed);
+            // RGB → NV12 geri dönüştür (encoder için)
+            DmaBufferPtr yuv_processed = rga.acquireOutputBuffer(
+                static_cast<uint32_t>(yuv_size), orig_aligned_w, orig_aligned_h,
+                detected_format);
+
+            if (yuv_processed) {
+                bool back_converted;
+                if (detected_format == PixelFormat::NV16) {
+                    back_converted = rga.rgb888ToNv16(rgb_large, orig_aligned_w, orig_aligned_h,
+                                                       yuv_processed, orig_aligned_w, orig_aligned_h);
+                } else {
+                    back_converted = rga.rgb888ToNv12(rgb_large, orig_aligned_w, orig_aligned_h,
+                                                       yuv_processed, orig_aligned_w, orig_aligned_h);
+                }
+
+                if (back_converted) {
+                    streamer.pushFrame(yuv_processed);
+                }
+            }
+        }
 
         if ((cnt+1) % 100 == 0) {
             std::cout << "[main] " << (cnt+1) << " islenmis frame stream'e gonderildi.\n";
         }
     });
 
-    // Demuxer callback: her yeni paket geldiğinde decoder'a gönder
+    // Demuxer callback
     demuxer.setPacketCallback([&](EncodedPacket&& packet) {
         if (!g_running.load()) return;
         decoder.feedPacket(std::move(packet));
     });
 
     std::cout << "[main] Pipeline baslatildi. Cikmak icin Ctrl+C basin.\n";
-    std::cout << "[main] Renkli yayin: rtsp://<firefly-ip>:8554/live\n";
+    std::cout << "[main] Yayin: rtsp://<board-ip>:8554/live\n";
 
     // Main loop
     while (g_running.load()) {
@@ -220,8 +289,8 @@ int main(int argc, char* argv[]) {
 
         auto stats = decoder.getStats();
         if (stats.frames_decoded % 300 == 0 && stats.frames_decoded > 0) {
-            std::cout << "[main] Decoder: " << stats.frames_decoded << " frame decoded, "
-                      << stats.frames_dropped << " dropped\n";
+            std::cout << "[main] Decoder: " << stats.frames_decoded
+                      << " decoded, " << stats.frames_dropped << " dropped\n";
         }
     }
 
@@ -230,9 +299,11 @@ int main(int argc, char* argv[]) {
     decoder.stop();
     demuxer.stop();
     streamer.stop();
+    yolo_engine.unload();
 
     auto final_stats = decoder.getStats();
-    std::cout << "[main] Toplam " << final_stats.frames_decoded << " frame cozuldu.\n";
+    std::cout << "[main] Toplam " << final_stats.frames_decoded
+              << " frame cozuldu.\n";
     std::cout << "[main] Pipeline kapatildi.\n";
 
     return 0;
