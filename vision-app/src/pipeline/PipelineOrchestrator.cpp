@@ -74,7 +74,10 @@ struct PipelineOrchestrator::Impl {
 
     std::atomic<uint64_t> frames_processed{0};
     std::atomic<uint64_t> frames_dropped{0};
-    std::atomic<uint64_t> last_inference_us{0};  // yolo.run()+fetchOutputs() wall-clock
+    std::atomic<uint64_t> last_inference_us{0};    // yolo.run()+fetchOutputs() wall-clock
+    std::atomic<uint64_t> last_letterbox_us{0};    // rga.process()
+    std::atomic<uint64_t> last_postprocess_us{0};  // decode+NMS+ByteTrack
+    std::atomic<uint64_t> last_draw_us{0};         // cloneFrame()+drawTrackedObjects()
     uint64_t frame_index = 0;  // sadece isleme thread'i dokunur
 
     std::vector<std::string> labels;  // coco_labels.txt, start()'ta yuklenir
@@ -123,12 +126,18 @@ struct PipelineOrchestrator::Impl {
                                                                 : RgaPixelFormat::NV12;
 
             // ADIM 1: letterbox -> 640x640 RGB888 (NPU girdisi)
+            auto lb_t0 = std::chrono::steady_clock::now();
             DmaBufferPtr rgb_model;
             LetterboxResult letterbox;
             if (!rga.process(frame, src_rga_fmt, rgb_model, letterbox)) {
                 std::cerr << "[PipelineOrchestrator] letterbox basarisiz, kare atlandi\n";
                 continue;
             }
+            auto lb_t1 = std::chrono::steady_clock::now();
+            last_letterbox_us.store(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(lb_t1 - lb_t0).count()),
+                std::memory_order_relaxed);
 
             // TESHIS: NPU'ya giden gercek letterbox'lanmis goruntuyu sadece
             // ilk karede diske yaz (bkz. dosya basindaki dumpRgbDebugPpm notu)
@@ -161,6 +170,8 @@ struct PipelineOrchestrator::Impl {
                         .count()),
                 std::memory_order_relaxed);
 
+            auto post_t0 = std::chrono::steady_clock::now();
+
             std::vector<YoloDetection> detections;
             float max_score = -1.0f;
             YoloPostProcessor::decodeOutputs(
@@ -185,7 +196,15 @@ struct PipelineOrchestrator::Impl {
             // "lost_count/max_lost_frames" bekletme mantigina GEREK YOK.
             auto tracked_objects = tracker.update(detections);
 
+            auto post_t1 = std::chrono::steady_clock::now();
+            last_postprocess_us.store(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(post_t1 - post_t0)
+                        .count()),
+                std::memory_order_relaxed);
+
             // ADIM 5: clone + dogrudan YUV uzerine cizim (RGB round-trip yok)
+            auto draw_t0 = std::chrono::steady_clock::now();
             DmaBufferPtr draw_frame;
             if (!rga.cloneFrame(frame, src_rga_fmt, draw_frame)) {
                 std::cerr << "[PipelineOrchestrator] frame clone basarisiz\n";
@@ -194,6 +213,12 @@ struct PipelineOrchestrator::Impl {
             if (!tracked_objects.empty()) {
                 YoloPostProcessor::drawTrackedObjects(draw_frame, tracked_objects, 4);
             }
+            auto draw_t1 = std::chrono::steady_clock::now();
+            last_draw_us.store(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(draw_t1 - draw_t0)
+                        .count()),
+                std::memory_order_relaxed);
 
             frames_processed.fetch_add(1, std::memory_order_relaxed);
 
@@ -305,6 +330,9 @@ PipelineOrchestrator::Stats PipelineOrchestrator::getStats() const {
     s.total_tracked = static_cast<uint32_t>(impl_->tracker.totalTracked());
     s.lost_tracks = static_cast<uint32_t>(impl_->tracker.lostCount());
     s.inference_ms = static_cast<double>(impl_->last_inference_us.load(std::memory_order_relaxed)) / 1000.0;
+    s.letterbox_ms = static_cast<double>(impl_->last_letterbox_us.load(std::memory_order_relaxed)) / 1000.0;
+    s.postprocess_ms = static_cast<double>(impl_->last_postprocess_us.load(std::memory_order_relaxed)) / 1000.0;
+    s.draw_ms = static_cast<double>(impl_->last_draw_us.load(std::memory_order_relaxed)) / 1000.0;
     return s;
 }
 

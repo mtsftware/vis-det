@@ -77,9 +77,13 @@ public:
         uint32_t total_tracked = 0;
         uint32_t lost_tracks = 0;
 
-        // Performans metrikleri (main.cpp'nin periyodik ozet satirinda basmasi icin):
+        // Performans metrikleri (main.cpp'nin periyodik ozet satirinda basmasi icin) —
+        // "neden 30fps'e ulasamiyoruz" arastirmasi icin asama-asama kirilim:
         double decode_ms = 0.0;       // MppDecoder::Stats::last_decode_ms (bkz. oradaki not)
-        double inference_ms = 0.0;    // son yolo.run()+fetchOutputs() wall-clock suresi
+        double letterbox_ms = 0.0;    // rga.process() (NPU girdisi icin letterbox+RGB donusum)
+        double inference_ms = 0.0;    // yolo.run()+fetchOutputs() wall-clock suresi
+        double postprocess_ms = 0.0;  // DFL decode + NMS + ByteTrack::update()
+        double draw_ms = 0.0;         // rga.cloneFrame() + drawTrackedObjects() (RGA cizim)
     };
     Stats getStats() const;
 

@@ -134,7 +134,10 @@ int main(int argc, char* argv[]) {
 
         std::cout << "[main] decode=" << stats.frames_decoded
                   << " (" << stats.decode_ms << "ms, " << decode_fps << " fps)"
+                  << " letterbox=" << stats.letterbox_ms << "ms"
                   << " inference=" << stats.inference_ms << "ms"
+                  << " postprocess=" << stats.postprocess_ms << "ms"
+                  << " cizim=" << stats.draw_ms << "ms"
                   << " islenen=" << stats.frames_processed
                   << " (end-to-end " << end_to_end_fps << " fps)"
                   << " dusen(bayat)=" << stats.frames_dropped
