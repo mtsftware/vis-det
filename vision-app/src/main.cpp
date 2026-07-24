@@ -57,7 +57,8 @@ int main(int argc, char* argv[]) {
     config.rtsp_url = rtsp_url;
     config.rtsp_latency_ms = 5000;
     config.coding = VideoCoding::H264;
-    config.model_path = "models/best-rk3588.rknn";
+    config.model_path = "models/yolov8n_int8.rknn";
+    config.labels_path = "models/coco_labels.txt";
     config.model_width = 640;
     config.model_height = 640;
     config.detection_conf_thresh = 0.4f;
@@ -84,7 +85,17 @@ int main(int argc, char* argv[]) {
         if (result.frame_index % 30 == 0) {
             std::cout << "[main] Frame " << result.frame_index << ": "
                       << result.detection_count << " tespit, "
-                      << result.tracked_objects.size() << " aktif track\n";
+                      << result.tracked_objects.size() << " aktif track";
+            const auto& labels = orchestrator.labels();
+            for (const auto& obj : result.tracked_objects) {
+                int cls = obj.detection.class_id;
+                std::cout << " [#" << obj.id << " "
+                          << (cls >= 0 && static_cast<size_t>(cls) < labels.size()
+                                  ? labels[static_cast<size_t>(cls)]
+                                  : std::to_string(cls))
+                          << " " << obj.detection.confidence << "]";
+            }
+            std::cout << "\n";
         }
     });
 

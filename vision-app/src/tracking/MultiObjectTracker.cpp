@@ -55,6 +55,9 @@ std::vector<TrackableObject> MultiObjectTracker::update(
         for (auto& [id, obj] : objects_) {
             if (!obj.active) continue;
             if (obj.lost_count > cfg_.max_lost_frames / 2) continue;  // çok kaybolan ile match etme
+            // COCO çok-sınıf: farklı sınıflar (örn. "person" vs "car")
+            // birbirinin track ID'sini çalmasın — sadece aynı sınıf eşleşir.
+            if (obj.detection.class_id != det.class_id) continue;
 
             // IoU hesapla
             float x1 = std::max(obj.detection.x, det.x);

@@ -32,7 +32,11 @@ struct PipelineConfig {
     std::string rtsp_url;
     uint32_t rtsp_latency_ms = 5000;
     VideoCoding coding = VideoCoding::H264;
-    std::string model_path = "models/best-rk3588.rknn";
+    // airockchip RKNN-optimised YOLOv8 export, COCO 80-sinif, 9 cikti
+    // tensoru (edge-ai-workshop-rknn/yolov8n_int8.rknn ile AYNI dosya) —
+    // eski tek-tensor best-rk3588.rknn'in YERINE.
+    std::string model_path = "models/yolov8n_int8.rknn";
+    std::string labels_path = "models/coco_labels.txt";
     uint32_t model_width = 640;
     uint32_t model_height = 640;
     float detection_conf_thresh = 0.4f;
@@ -81,6 +85,11 @@ public:
     uint32_t sourceWidth() const;
     uint32_t sourceHeight() const;
     PixelFormat sourceFormat() const;
+
+    // coco_labels.txt icerigi (start() sirasinda yuklenir). class_id bu
+    // vektorun bir indeksidir; sinir disi/yuklenemediyse bos liste doner
+    // (cagiran numerik ID'ye geri duser).
+    const std::vector<std::string>& labels() const;
 
     static void pinCurrentThreadToBigCores();
     static void restoreCurrentThreadAllCores();

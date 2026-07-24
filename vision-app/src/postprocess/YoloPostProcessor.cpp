@@ -8,24 +8,38 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <limits>
 #include <vector>
 
 YoloPostProcessor::YoloPostProcessor() = default;
 
-// Model output [1, 5, 8400] CHANNEL-FIRST (NCHW) uyumlu decode:
-//   Channel 0: cx, Channel 1: cy, Channel 2: w, Channel 3: h, Channel 4: score
-//   Bellek layoutu: data[channel * 8400 + anchor_index]
-//   Skor kanali ONNX grafiginde zaten Sigmoid'den gecmis geliyor
-//   (verification/read.md) — burada ELLE sigmoid UYGULANMAZ.
-bool YoloPostProcessor::decodeOutputs(const void* raw_output, uint32_t raw_size,
+namespace {
+constexpr int kNumScales = 3;
+constexpr int kRegMax = 16;
+constexpr int kStrides[kNumScales] = {8, 16, 32};
+}  // namespace
+
+// airockchip RKNN-optimised YOLOv8 export decode — referans:
+// edge-ai-workshop-rknn/inference.py (_postprocess_rknn + _dfl_decode).
+// 9 cikti: [box_s,score_s,sum_s] x 3 olcek (stride 8/16/32). box_s [1,64,H,W]
+// NCHW = 4 kenar x REG_MAX=16 DFL bin (softmax + agirlikli beklenti ile
+// piksel mesafesine cevrilir); score_s [1,nc,H,W] NCHW zaten Sigmoid'den
+// gecmis (burada TEKRAR sigmoid UYGULANMAZ).
+bool YoloPostProcessor::decodeOutputs(const YoloInferenceEngine& engine,
                                        int orig_w, int orig_h,
                                        const LetterboxResult& letterbox,
                                        float conf_thresh,
                                        std::vector<YoloDetection>& detections,
                                        float* out_max_score) {
-    if (!raw_output || raw_size == 0) {
-        std::cerr << "[YoloPostProcessor] Bos cikti\n";
+    detections.clear();
+    detections.reserve(256);
+    float max_score = -1.0f;
+
+    if (engine.outputCount() < kNumScales * 3) {
+        std::cerr << "[YoloPostProcessor] beklenen >=" << (kNumScales * 3)
+                  << " RKNN cikti tensoru, alinan " << engine.outputCount() << "\n";
         return false;
     }
     if (letterbox.ratio < 1e-9) {
@@ -33,63 +47,110 @@ bool YoloPostProcessor::decodeOutputs(const void* raw_output, uint32_t raw_size,
         return false;
     }
 
-    const float* data = static_cast<const float*>(raw_output);
-
-    // Model output: [1, 5, 8400]
-    // CH (channel count): 5 = 4 (box) + 1 (score)
-    // NA (num anchors): 8400 (640x640 girdi icin 80x80 + 40x40 + 20x20)
-    const int NA = 8400;
-
     const double inv_ratio = 1.0 / letterbox.ratio;
+    float dfl_bins[kRegMax];
 
-    detections.clear();
-    detections.reserve(256);
+    for (int s = 0; s < kNumScales; ++s) {
+        const void* box_ptr = nullptr;
+        uint32_t box_size = 0;
+        const void* score_ptr = nullptr;
+        uint32_t score_size = 0;
+        // outputs[s*3+2] (sum) kullanilmiyor, atlanir.
+        if (!engine.getOutput(s * 3 + 0, box_ptr, box_size)) continue;
+        if (!engine.getOutput(s * 3 + 1, score_ptr, score_size)) continue;
+        if (!box_ptr || !score_ptr) continue;
 
-    float max_score = -1.0f;
+        const auto& score_info = engine.outputInfo(s * 3 + 1);
+        // NCHW dims: [1, nc, H, W]
+        if (score_info.n_dims < 4) {
+            std::cerr << "[YoloPostProcessor] scale " << s << ": score tensor n_dims<4\n";
+            continue;
+        }
+        int nc = score_info.dims[1];
+        int H = score_info.dims[2];
+        int W = score_info.dims[3];
+        if (nc <= 0 || H <= 0 || W <= 0) continue;
 
-    for (int i = 0; i < NA; ++i) {
-        float score = data[4 * NA + i];
-        if (score > max_score) max_score = score;
-        if (score < conf_thresh) continue;
+        const int HW = H * W;
+        const int stride = kStrides[s];
+        const float* box = static_cast<const float*>(box_ptr);      // [64, H, W]
+        const float* score = static_cast<const float*>(score_ptr);  // [nc, H, W]
 
-        // Box degerlerini al (center-x, center-y, width, height) — 640x640
-        // letterbox uzayinda.
-        float cx = data[0 * NA + i];
-        float cy = data[1 * NA + i];
-        float w  = data[2 * NA + i];
-        float h  = data[3 * NA + i];
+        for (int a = 0; a < HW; ++a) {
+            // Bu anchor'in en yuksek sinif skoru (score[c*HW + a])
+            float best_score = -std::numeric_limits<float>::infinity();
+            int best_cls = -1;
+            for (int c = 0; c < nc; ++c) {
+                float sc = score[c * HW + a];
+                if (sc > best_score) {
+                    best_score = sc;
+                    best_cls = c;
+                }
+            }
+            if (best_score > max_score) max_score = best_score;
+            if (best_score < conf_thresh) continue;
 
-        // center-x,y -> top-left x,y (hala letterbox uzayinda)
-        float lx = cx - w / 2.0f;
-        float ly = cy - h / 2.0f;
+            // DFL decode: 4 kenar (left,top,right,bottom), her biri REG_MAX
+            // bin — bellek layoutu [64,H,W] NCHW oldugu icin bin'ler arasi
+            // stride HW eleman (bitisik DEGIL).
+            float ltrb[4];
+            for (int side = 0; side < 4; ++side) {
+                float bmax = -std::numeric_limits<float>::infinity();
+                for (int b = 0; b < kRegMax; ++b) {
+                    float v = box[(side * kRegMax + b) * HW + a];
+                    dfl_bins[b] = v;
+                    if (v > bmax) bmax = v;
+                }
+                float sum = 0.0f;
+                for (int b = 0; b < kRegMax; ++b) {
+                    float e = std::exp(dfl_bins[b] - bmax);
+                    dfl_bins[b] = e;
+                    sum += e;
+                }
+                float expectation = 0.0f;
+                for (int b = 0; b < kRegMax; ++b) {
+                    expectation += (dfl_bins[b] / sum) * static_cast<float>(b);
+                }
+                ltrb[side] = expectation * static_cast<float>(stride);
+            }
 
-        // Letterbox TERS donusum: pad offset'ini cikar, ratio'ya bol —
-        // duz stretch/scale_x-scale_y YERINE (RgaPreprocessor::process()
-        // ile birebir tutarli tersleme).
-        float x = static_cast<float>((lx - letterbox.dst_offset_x) * inv_ratio);
-        float y = static_cast<float>((ly - letterbox.dst_offset_y) * inv_ratio);
-        float bw = static_cast<float>(w * inv_ratio);
-        float bh = static_cast<float>(h * inv_ratio);
+            // Anchor merkezi (letterbox-uzayi piksel)
+            int hh = a / W;
+            int ww = a % W;
+            float gx = (static_cast<float>(ww) + 0.5f) * stride;
+            float gy = (static_cast<float>(hh) + 0.5f) * stride;
 
-        // Frame sinirlari icinde tut
-        x = std::max(0.0f, x);
-        y = std::max(0.0f, y);
-        bw = std::min(bw, static_cast<float>(orig_w) - x);
-        bh = std::min(bh, static_cast<float>(orig_h) - y);
+            float lx1 = gx - ltrb[0];
+            float ly1 = gy - ltrb[1];
+            float lx2 = gx + ltrb[2];
+            float ly2 = gy + ltrb[3];
 
-        // Minimum boyut kontrolü
-        if (bw < 1.0f || bh < 1.0f) continue;
+            // Letterbox TERS donusum: pad offset'ini cikar, ratio'ya bol.
+            float x1 = static_cast<float>((lx1 - letterbox.dst_offset_x) * inv_ratio);
+            float y1 = static_cast<float>((ly1 - letterbox.dst_offset_y) * inv_ratio);
+            float x2 = static_cast<float>((lx2 - letterbox.dst_offset_x) * inv_ratio);
+            float y2 = static_cast<float>((ly2 - letterbox.dst_offset_y) * inv_ratio);
 
-        YoloDetection det;
-        det.x = x;
-        det.y = y;
-        det.width = bw;
-        det.height = bh;
-        det.confidence = score;
-        det.class_id = 0;  // tek-class model
-        det.track_id = -1;
+            x1 = std::max(0.0f, x1);
+            y1 = std::max(0.0f, y1);
+            x2 = std::min(x2, static_cast<float>(orig_w));
+            y2 = std::min(y2, static_cast<float>(orig_h));
 
-        detections.push_back(det);
+            float bw = x2 - x1;
+            float bh = y2 - y1;
+            if (bw < 1.0f || bh < 1.0f) continue;
+
+            YoloDetection det;
+            det.x = x1;
+            det.y = y1;
+            det.width = bw;
+            det.height = bh;
+            det.confidence = best_score;
+            det.class_id = best_cls;
+            det.track_id = -1;
+
+            detections.push_back(det);
+        }
     }
 
     if (out_max_score) *out_max_score = max_score;
@@ -101,33 +162,61 @@ std::vector<YoloDetection> YoloPostProcessor::applyNMS(std::vector<YoloDetection
                                                           float iou_thresh) {
     if (detections.empty()) return {};
 
-    // confidence'e göre sırala
+    // Sinif ID'sine gore grupla (once sinif, sonra confidence azalan) — HER
+    // SINIF ICINDE AYRI NMS uygulanir, farkli siniflarin ust uste binen
+    // kutulari birbirini bastirmaz (referans: inference.py per-class NMS).
     std::sort(detections.begin(), detections.end(),
               [](const YoloDetection& a, const YoloDetection& b) {
+                  if (a.class_id != b.class_id) return a.class_id < b.class_id;
                   return a.confidence > b.confidence;
               });
 
-    std::vector<bool> suppressed(detections.size(), false);
     std::vector<YoloDetection> result;
     result.reserve(detections.size());
 
-    for (size_t i = 0; i < detections.size(); ++i) {
-        if (suppressed[i]) continue;
+    size_t i = 0;
+    while (i < detections.size()) {
+        size_t j = i;
+        while (j < detections.size() && detections[j].class_id == detections[i].class_id) ++j;
 
-        result.push_back(detections[i]);
+        // [i, j) araligi tek sinif, confidence'e gore zaten sirali.
+        std::vector<bool> suppressed(j - i, false);
+        for (size_t a = i; a < j; ++a) {
+            if (suppressed[a - i]) continue;
+            result.push_back(detections[a]);
 
-        for (size_t j = i + 1; j < detections.size(); ++j) {
-            if (suppressed[j]) continue;
-
-            // DIoU (plain IoU DEĞİL) — merkez mesafesi de cezalandırılır.
-            float diou = calculateDiou(detections[i], detections[j]);
-            if (diou > iou_thresh) {
-                suppressed[j] = true;
+            for (size_t b = a + 1; b < j; ++b) {
+                if (suppressed[b - i]) continue;
+                // DIoU (plain IoU DEĞİL) — merkez mesafesi de cezalandırılır.
+                float diou = calculateDiou(detections[a], detections[b]);
+                if (diou > iou_thresh) {
+                    suppressed[b - i] = true;
+                }
             }
         }
+        i = j;
     }
 
+    std::sort(result.begin(), result.end(),
+              [](const YoloDetection& a, const YoloDetection& b) {
+                  return a.confidence > b.confidence;
+              });
     return result;
+}
+
+std::vector<std::string> YoloPostProcessor::loadLabels(const std::string& path) {
+    std::vector<std::string> labels;
+    std::ifstream f(path);
+    if (!f) {
+        std::cerr << "[YoloPostProcessor] Etiket dosyasi acilamadi: " << path << "\n";
+        return labels;
+    }
+    std::string line;
+    while (std::getline(f, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
+        if (!line.empty()) labels.push_back(line);
+    }
+    return labels;
 }
 
 namespace {

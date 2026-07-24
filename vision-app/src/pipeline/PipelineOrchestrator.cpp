@@ -76,6 +76,8 @@ struct PipelineOrchestrator::Impl {
     std::atomic<uint64_t> frames_dropped{0};
     uint64_t frame_index = 0;  // sadece isleme thread'i dokunur
 
+    std::vector<std::string> labels;  // coco_labels.txt, start()'ta yuklenir
+
     explicit Impl(PipelineConfig cfg) : config(std::move(cfg)) {}
 
     void onFrame(DmaBufferPtr frame) {
@@ -141,11 +143,9 @@ struct PipelineOrchestrator::Impl {
                 continue;
             }
 
-            // ADIM 3: output decode + DIoU-NMS
-            const void* raw_output = nullptr;
-            uint32_t output_size = 0;
-            if (!yolo.getOutput(raw_output, output_size)) {
-                std::cerr << "[PipelineOrchestrator] YOLO output alinamadi\n";
+            // ADIM 3: 9 cikti tensorunu TEK cagriyla al, DFL decode + DIoU-NMS
+            if (!yolo.fetchOutputs()) {
+                std::cerr << "[PipelineOrchestrator] YOLO ciktilari alinamadi\n";
                 yolo.releaseOutputs();
                 continue;
             }
@@ -153,7 +153,7 @@ struct PipelineOrchestrator::Impl {
             std::vector<YoloDetection> detections;
             float max_score = -1.0f;
             YoloPostProcessor::decodeOutputs(
-                raw_output, output_size,
+                yolo,
                 static_cast<int>(source_width.load()), static_cast<int>(source_height.load()),
                 letterbox, config.detection_conf_thresh, detections, &max_score);
 
@@ -214,6 +214,10 @@ bool PipelineOrchestrator::start() {
                   << impl_->config.model_path << "\n";
         return false;
     }
+    impl_->labels = YoloPostProcessor::loadLabels(impl_->config.labels_path);
+    std::cout << "[PipelineOrchestrator] " << impl_->labels.size()
+              << " sinif etiketi yuklendi: " << impl_->config.labels_path << "\n";
+
     if (!impl_->rga.configure(impl_->config.model_width, impl_->config.model_height,
                                RgaPixelFormat::RGB888)) {
         std::cerr << "[PipelineOrchestrator] RgaPreprocessor configure basarisiz\n";
@@ -303,6 +307,10 @@ uint32_t PipelineOrchestrator::sourceHeight() const {
 
 PixelFormat PipelineOrchestrator::sourceFormat() const {
     return impl_->source_format;
+}
+
+const std::vector<std::string>& PipelineOrchestrator::labels() const {
+    return impl_->labels;
 }
 
 void PipelineOrchestrator::pinCurrentThreadToBigCores() {
