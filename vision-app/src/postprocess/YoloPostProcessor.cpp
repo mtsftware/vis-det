@@ -49,6 +49,10 @@ bool YoloPostProcessor::decodeOutputs(const YoloInferenceEngine& engine,
 
     const double inv_ratio = 1.0 / letterbox.ratio;
     float dfl_bins[kRegMax];
+    // Olcekler arasi yeniden kullanilir (assign() ile boyutlandirilir) —
+    // her karede/olcekte yeniden tahsis etmemek icin donguden disarida.
+    static thread_local std::vector<float> best_score_buf;
+    static thread_local std::vector<int> best_cls_buf;
 
     for (int s = 0; s < kNumScales; ++s) {
         const void* box_ptr = nullptr;
@@ -76,17 +80,32 @@ bool YoloPostProcessor::decodeOutputs(const YoloInferenceEngine& engine,
         const float* box = static_cast<const float*>(box_ptr);      // [64, H, W]
         const float* score = static_cast<const float*>(score_ptr);  // [nc, H, W]
 
-        for (int a = 0; a < HW; ++a) {
-            // Bu anchor'in en yuksek sinif skoru (score[c*HW + a])
-            float best_score = -std::numeric_limits<float>::infinity();
-            int best_cls = -1;
-            for (int c = 0; c < nc; ++c) {
-                float sc = score[c * HW + a];
-                if (sc > best_score) {
-                    best_score = sc;
-                    best_cls = c;
+        // PERFORMANS: sinif-max hesabini SINIF-MAJOR (c disarida, a icinde)
+        // sirayla yap — score[c*HW+a] boylece c sabitken a ARDIL (contiguous)
+        // okunur. Onceki surum a-disarida/c-iceride donuyordu; score[c*HW+a]
+        // her c adiminda HW (400-6400) eleman ATLAYARAK okunuyordu — L1/L2
+        // once bellek acisindan cok kotu bir erisim deseniydi ve
+        // postprocess'in olcumlerde ~10ms'ye cikmasinin ana sebebiydi
+        // (8400 anchor x 80 sinif = 672.000 tamamen sicramali okuma).
+        // Simdi HER SINIF ICIN HW'lik ardil bir satir taranir (kalibre
+        // edilmis onbellek dostu erisim), toplam is ayni ama bellek deseni
+        // COK daha hizli.
+        best_score_buf.assign(static_cast<size_t>(HW), -std::numeric_limits<float>::infinity());
+        best_cls_buf.assign(static_cast<size_t>(HW), -1);
+        for (int c = 0; c < nc; ++c) {
+            const float* score_c = score + static_cast<size_t>(c) * HW;  // ardil HW eleman
+            for (int a = 0; a < HW; ++a) {
+                float sc = score_c[a];
+                if (sc > best_score_buf[static_cast<size_t>(a)]) {
+                    best_score_buf[static_cast<size_t>(a)] = sc;
+                    best_cls_buf[static_cast<size_t>(a)] = c;
                 }
             }
+        }
+
+        for (int a = 0; a < HW; ++a) {
+            float best_score = best_score_buf[static_cast<size_t>(a)];
+            int best_cls = best_cls_buf[static_cast<size_t>(a)];
             if (best_score > max_score) max_score = best_score;
             if (best_score < conf_thresh) continue;
 

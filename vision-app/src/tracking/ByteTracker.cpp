@@ -400,10 +400,21 @@ struct AssignmentResult {
 // Esik degerli Macar algoritmasi — referans: bytetracker_fix.py
 // _linear_assignment(). cost[i][j] <= thresh olmayan eslesmeler atilir
 // (her iki taraf da "unmatched" listesine duser).
-AssignmentResult linearAssignment(const std::vector<std::vector<float>>& cost, float thresh) {
+//
+// n_a/n_b DISARIDAN acikca verilir — cost.size()/cost[0].size()'a
+// GUVENILMEZ, cunku vector<vector<float>>(n_a=0, ...) 0 SATIRLI bir
+// matris uretir ve bu durumda n_b (sutun sayisi) bilgisi TAMAMEN
+// KAYBOLUR (cost[0] diye bir satir yok). BUG (bulunup duzeltildi):
+// n_a=0 oldugunda (ornegin ilk eslestirmede strack_pool bos) eski kod
+// m'yi de 0 sayiyordu, boylece TUM n_b adayi "unmatched_b" listesine
+// eklenmek yerine sessizce kayboluyordu — sonucta hicbir yeni track
+// ASLA olusturulamiyordu (Adim 6'ya hic aday gelmiyordu), dolayisiyla
+// ekrana hicbir rectangle cizilmiyordu.
+AssignmentResult linearAssignment(const std::vector<std::vector<float>>& cost, int n_a, int n_b,
+                                   float thresh) {
     AssignmentResult result;
-    int n = static_cast<int>(cost.size());
-    int m = (n > 0) ? static_cast<int>(cost[0].size()) : 0;
+    int n = n_a;
+    int m = n_b;
 
     if (n == 0 || m == 0) {
         for (int i = 0; i < n; ++i) result.unmatched_a.push_back(i);
@@ -562,7 +573,8 @@ std::vector<TrackedBox> ByteTracker::update(const std::vector<YoloDetection>& de
     for (auto& t : dets_high) high_raw.push_back(t.get());
 
     auto dist1 = iouDistance(pool_raw, high_raw);
-    auto res1 = linearAssignment(dist1, ByteTrackConfig::kMatchThresh);
+    auto res1 = linearAssignment(dist1, static_cast<int>(pool_raw.size()),
+                                  static_cast<int>(high_raw.size()), ByteTrackConfig::kMatchThresh);
 
     for (auto& mij : res1.matches) {
         auto& track = strack_pool[static_cast<size_t>(mij.first)];
@@ -593,7 +605,8 @@ std::vector<TrackedBox> ByteTracker::update(const std::vector<YoloDetection>& de
     for (auto& t : dets_low) low_raw.push_back(t.get());
 
     auto dist2 = iouDistance(r_tracked_raw, low_raw);
-    auto res2 = linearAssignment(dist2, ByteTrackConfig::kLowMatchThresh);
+    auto res2 = linearAssignment(dist2, static_cast<int>(r_tracked_raw.size()),
+                                  static_cast<int>(low_raw.size()), ByteTrackConfig::kLowMatchThresh);
 
     for (auto& mij : res2.matches) {
         auto& track = r_tracked[static_cast<size_t>(mij.first)];
@@ -622,7 +635,9 @@ std::vector<TrackedBox> ByteTracker::update(const std::vector<YoloDetection>& de
     for (auto& t : dets_cp) dets_cp_raw.push_back(t.get());
 
     auto dist3 = iouDistance(unconfirmed_raw, dets_cp_raw);
-    auto res3 = linearAssignment(dist3, ByteTrackConfig::kUnconfirmedMatchThresh);
+    auto res3 = linearAssignment(dist3, static_cast<int>(unconfirmed_raw.size()),
+                                  static_cast<int>(dets_cp_raw.size()),
+                                  ByteTrackConfig::kUnconfirmedMatchThresh);
 
     for (auto& mij : res3.matches) {
         unconfirmed[static_cast<size_t>(mij.first)]->updateMatched(
