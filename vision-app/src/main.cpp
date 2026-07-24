@@ -141,6 +141,7 @@ int main(int argc, char* argv[]) {
                   << " islenen=" << stats.frames_processed
                   << " (end-to-end " << end_to_end_fps << " fps)"
                   << " dusen(bayat)=" << stats.frames_dropped
+                  << " dusen(npu->post)=" << stats.npu_results_dropped
                   << " aktif_track=" << stats.active_tracks
                   << " kaybolan=" << stats.lost_tracks << "\n";
     }

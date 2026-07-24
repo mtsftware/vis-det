@@ -72,18 +72,23 @@ public:
     struct Stats {
         uint64_t frames_decoded = 0;
         uint64_t frames_processed = 0;
-        uint64_t frames_dropped = 0;  // en-yeni-kare slotu doluyken gelen (bayat) kareler
+        uint64_t frames_dropped = 0;      // decode->NPU en-yeni-kare slotunda dusen (bayat) kareler
+        uint64_t npu_results_dropped = 0; // NPU->post en-yeni-sonuc slotunda dusen (post yetismedi)
         uint32_t active_tracks = 0;
         uint32_t total_tracked = 0;
         uint32_t lost_tracks = 0;
 
         // Performans metrikleri (main.cpp'nin periyodik ozet satirinda basmasi icin) —
-        // "neden 30fps'e ulasamiyoruz" arastirmasi icin asama-asama kirilim:
+        // "neden 30fps'e ulasamiyoruz" arastirmasi icin asama-asama kirilim.
+        // letterbox+inference+postprocess NPU thread'inde, draw_ms POST
+        // thread'inde (NPU'yla PARALEL) olculur — bkz. PipelineOrchestrator.cpp
+        // sinif basi notu (pipelining).
         double decode_ms = 0.0;       // MppDecoder::Stats::last_decode_ms (bkz. oradaki not)
         double letterbox_ms = 0.0;    // rga.process() (NPU girdisi icin letterbox+RGB donusum)
         double inference_ms = 0.0;    // yolo.run()+fetchOutputs() wall-clock suresi
-        double postprocess_ms = 0.0;  // DFL decode + NMS + ByteTrack::update()
-        double draw_ms = 0.0;         // rga.cloneFrame() + drawTrackedObjects() (RGA cizim)
+        double postprocess_ms = 0.0;  // DFL decode + NMS (NPU thread'inde)
+        double draw_ms = 0.0;         // ByteTrack::update() + cloneFrame() + drawTrackedObjects()
+                                       // (POST thread'inde, NPU'nun bir sonraki karesiyle PARALEL)
     };
     Stats getStats() const;
 
