@@ -7,4 +7,3 @@ You MUST STRICTLY adhere to the following constraints. Do not attempt to bypass 
 - **NO AUTO-BUILDING:** Do NOT execute any build commands (`make`, `cmake`, `gcc`, etc.).
 - **NO AUTO-TESTING:** Do NOT execute the compiled binaries, run test scripts, or attempt to validate the code by running it.
 - *Your sole responsibility is to analyze the provided files, reason about the architecture, and generate necessary code.*
--**Don't use git commands**
