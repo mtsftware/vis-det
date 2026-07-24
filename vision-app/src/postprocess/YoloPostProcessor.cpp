@@ -22,7 +22,8 @@ bool YoloPostProcessor::decodeOutputs(const void* raw_output, uint32_t raw_size,
                                        int orig_w, int orig_h,
                                        const LetterboxResult& letterbox,
                                        float conf_thresh,
-                                       std::vector<YoloDetection>& detections) {
+                                       std::vector<YoloDetection>& detections,
+                                       float* out_max_score) {
     if (!raw_output || raw_size == 0) {
         std::cerr << "[YoloPostProcessor] Bos cikti\n";
         return false;
@@ -44,8 +45,11 @@ bool YoloPostProcessor::decodeOutputs(const void* raw_output, uint32_t raw_size,
     detections.clear();
     detections.reserve(256);
 
+    float max_score = -1.0f;
+
     for (int i = 0; i < NA; ++i) {
         float score = data[4 * NA + i];
+        if (score > max_score) max_score = score;
         if (score < conf_thresh) continue;
 
         // Box degerlerini al (center-x, center-y, width, height) — 640x640
@@ -87,6 +91,8 @@ bool YoloPostProcessor::decodeOutputs(const void* raw_output, uint32_t raw_size,
 
         detections.push_back(det);
     }
+
+    if (out_max_score) *out_max_score = max_score;
 
     return !detections.empty();
 }

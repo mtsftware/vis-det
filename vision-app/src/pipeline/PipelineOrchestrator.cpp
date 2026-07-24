@@ -13,9 +13,37 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <thread>
+
+namespace {
+
+// TESHIS YARDIMCISI: NPU'ya giden letterbox'lanmis RGB888 karesini binary
+// PPM (P6) olarak diske yazar — "0 tespit" durumunda modele giden goruntunun
+// gercekten dogru (renk sirasi RGB mi BGR mi, letterbox geometrisi dogru mu)
+// olup olmadigini GOZLE dogrulamak icin. Sadece bir kez (ilk kare) cagrilir,
+// uretimde performans etkisi yok. `scp board:/tmp/vision_app_debug_input.ppm .`
+// ile indirip acabilirsiniz (GIMP/feh/vs ppm'i dogrudan acar).
+void dumpRgbDebugPpm(const DmaBufferPtr& rgb, const char* path) {
+    if (!rgb || !rgb->virt_addr) {
+        std::cerr << "[PipelineOrchestrator] debug PPM: virt_addr yok, atlaniyor\n";
+        return;
+    }
+    std::ofstream f(path, std::ios::binary);
+    if (!f) {
+        std::cerr << "[PipelineOrchestrator] debug PPM acilamadi: " << path << "\n";
+        return;
+    }
+    f << "P6\n" << rgb->width << " " << rgb->height << "\n255\n";
+    f.write(static_cast<const char*>(rgb->virt_addr),
+            static_cast<std::streamsize>(static_cast<size_t>(rgb->width) * rgb->height * 3));
+    std::cout << "[PipelineOrchestrator] NPU girdisi diske yazildi: " << path
+              << " (" << rgb->width << "x" << rgb->height << ", RGB888)\n";
+}
+
+}  // namespace
 
 struct PipelineOrchestrator::Impl {
     PipelineConfig config;
@@ -99,6 +127,13 @@ struct PipelineOrchestrator::Impl {
                 continue;
             }
 
+            // TESHIS: NPU'ya giden gercek letterbox'lanmis goruntuyu sadece
+            // ilk karede diske yaz (bkz. dosya basindaki dumpRgbDebugPpm notu)
+            // — "0 tespit" teshisinde renk/geometri dogrulamasi icin.
+            if (frame_index == 0) {
+                dumpRgbDebugPpm(rgb_model, "/tmp/vision_app_debug_input.ppm");
+            }
+
             // ADIM 2: YOLO inference (NPU)
             uint32_t input_size = static_cast<uint32_t>(rgb_model->size);
             if (!yolo.run(rgb_model->virt_addr, input_size)) {
@@ -116,10 +151,18 @@ struct PipelineOrchestrator::Impl {
             }
 
             std::vector<YoloDetection> detections;
+            float max_score = -1.0f;
             YoloPostProcessor::decodeOutputs(
                 raw_output, output_size,
                 static_cast<int>(source_width.load()), static_cast<int>(source_height.load()),
-                letterbox, config.detection_conf_thresh, detections);
+                letterbox, config.detection_conf_thresh, detections, &max_score);
+
+            if (frame_index % 30 == 0) {
+                std::cout << "[PipelineOrchestrator] frame " << frame_index
+                          << ": max_score(esiksiz)=" << max_score
+                          << " esik=" << config.detection_conf_thresh
+                          << " ham_tespit=" << detections.size() << "\n";
+            }
 
             if (!detections.empty()) {
                 detections = YoloPostProcessor::applyNMS(detections, config.nms_iou_thresh);

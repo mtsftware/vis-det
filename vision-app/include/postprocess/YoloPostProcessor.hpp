@@ -43,13 +43,20 @@ public:
     //            (ratio + dst_offset_x/y) — model 640x640 letterbox
     //            uzayindaki kutuyu orijinal kareye dogru geri tasir.
     // conf_thresh: minimum guven esigi (0.0~1.0)
+    // out_max_score: non-null verilirse, esik uygulanmadan ONCE 8400
+    //                anchor'in en yuksek skoru buraya yazilir — "0 tespit"
+    //                durumunda modelin gercekten hicbir sey gormedigini mi
+    //                yoksa skorlarin esigin biraz altinda mi kaldigini
+    //                (veya girdi/decode bozuksa skorlarin anlamsiz/sabit
+    //                kaldigini) ayirt etmek icin teshis amacli.
     //
     // Donus: confidence esigi uzerindeki tum tespitlerin listesi
     static bool decodeOutputs(const void* raw_output, uint32_t raw_size,
                               int orig_w, int orig_h,
                               const LetterboxResult& letterbox,
                               float conf_thresh,
-                              std::vector<YoloDetection>& detections);
+                              std::vector<YoloDetection>& detections,
+                              float* out_max_score = nullptr);
 
     // DIoU-NMS: birbiriyle örtüşen bbox'ları filtreler.
     // DIoU (Distance-IoU) — merkez mesafesini de cezalandirir, plain IoU'dan
