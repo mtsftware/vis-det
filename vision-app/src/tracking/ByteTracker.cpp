@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <memory>
 #include <set>
 #include <utility>
@@ -685,6 +686,30 @@ std::vector<TrackedBox> ByteTracker::update(const std::vector<YoloDetection>& de
         tb.class_id = t->class_id;
         output.push_back(tb);
     }
+
+    // TESHIS: "hic cizilmiyor" arastirmasi icin — ByteTrack'in 2-kareli
+    // onay mekanizmasinin (kUnconfirmedMatchThresh=0.7, Adim 5) track'leri
+    // hic onaylamadan silip silmedigini gormek. unconfirmed_after >
+    // unconfirmed(bu karenin basindaki) ise yeni track'ler onaylanmiyor
+    // demektir — o zaman esik cok siki (detection kutulari kare-kare
+    // yeterince ortusmuyor) olabilir.
+    if (frame_id % 30 == 0) {
+        size_t unconfirmed_after = 0;
+        for (auto& t : S.tracked_stracks) {
+            if (!t->is_activated) ++unconfirmed_after;
+        }
+        std::cout << "[ByteTracker] frame " << frame_id
+                  << ": dets_high=" << dets_high.size() << " dets_low=" << dets_low.size()
+                  << " stage1_match=" << res1.matches.size()
+                  << " stage2_match=" << res2.matches.size()
+                  << " stage3_match(onay)=" << res3.matches.size()
+                  << " onay_bekleyen_bu_kare=" << unconfirmed.size()
+                  << " onay_bekleyen_sonraki_kare=" << unconfirmed_after
+                  << " tracked_stracks=" << S.tracked_stracks.size()
+                  << " lost_stracks=" << S.lost_stracks.size()
+                  << " CIKTI(cizilecek)=" << output.size() << "\n";
+    }
+
     return output;
 }
 
