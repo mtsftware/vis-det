@@ -34,7 +34,7 @@ int main(int argc, char* argv[]) {
     std::cout << "  Vision App - YOLOv8n + Multi-Object Tracking Pipeline\n";
     std::cout << "============================================================\n";
     std::cout << "RTSP Kaynak : " << rtsp_url << "\n";
-    std::cout << "Yayin URL   : rtsp://<board-ip>:8554/live\n";
+    std::cout << "Yayin URL   : rtsp://<board-ip>:8557/out\n";
     std::cout << "============================================================\n";
 
     signal(SIGINT, signalHandler);
@@ -42,7 +42,11 @@ int main(int argc, char* argv[]) {
 
     const uint32_t fps = 30;
 
-    RtspStreamer streamer(8554, "/live", 1280, 720, fps);
+    // Cikis portu GIRDI kaynagindan (rtsp_url, orn. ffmpeg'in dinledigi
+    // 8554) BILEREK farkli — ayni makinede ikisi de 8554'e bind etmeye
+    // calisirsa cakisir (referans: tracking-app main_m11_test.cpp, giris
+    // degisken/cikis hep 8557/out).
+    RtspStreamer streamer(8557, "/out", 1280, 720, fps);
     if (!streamer.start()) {
         std::cerr << "[main] Streamer baslatilamadi!\n";
         return 1;
@@ -91,7 +95,7 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "[main] Pipeline baslatildi. Cikmak icin Ctrl+C basin.\n";
-    std::cout << "[main] Yayin: rtsp://<board-ip>:8554/live\n";
+    std::cout << "[main] Yayin: rtsp://<board-ip>:8557/out\n";
 
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
