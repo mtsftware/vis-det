@@ -32,10 +32,10 @@ struct YoloDetection {
     int track_id = -1;  // tracker tarafindan atanir
 };
 
-// Forward declare: MultiObjectTracker.hpp bu header'i (YoloDetection icin)
-// include ediyor, dongusel include'dan kacinmak icin tam tanim yerine ileri
-// bildirim yeterli (drawTrackedObjects sadece imza icin kullaniyor).
-struct TrackableObject;
+// Forward declare: ByteTracker.hpp bu header'i (YoloDetection icin) include
+// ediyor, dongusel include'dan kacinmak icin tam tanim yerine ileri bildirim
+// yeterli (drawTrackedObjects sadece imza icin kullaniyor).
+struct TrackedBox;
 
 class YoloPostProcessor {
 public:
@@ -72,16 +72,22 @@ public:
     // liste doner (cagiran numerik ID'ye geri duser).
     static std::vector<std::string> loadLabels(const std::string& path);
 
-    // Referans: tracking-app main_m11_test.cpp drawBboxOutline() ile AYNI
-    // teknik (RGA imfillArray, 4 ince dikdortgen kenar, 2-hizali rect'ler) —
-    // RGB donusumune GEREK YOK, dogrudan decode'un native formatinda (NV12/
-    // NV16) frame uzerine cizer. Tek fark: referans TEK hedef ciziyordu,
-    // burada TÜM aktif track'ler (MOT) donguyle cizilir, renk track_id'ye
-    // gore degisir (kaybolan track'ler kirmizi/soluk).
+    // Cizim TEKNIGI referansi: tracking-app main_m11_test.cpp
+    // drawBboxOutline() ile AYNI (RGA imfillArray, 4 ince dikdortgen kenar,
+    // 2-hizali rect'ler) — RGB donusumune GEREK YOK, dogrudan decode'un
+    // native formatinda (NV12/NV16) frame uzerine cizer.
+    // RENK semasi referansi: edge-ai-workshop-rknn/overlay.py
+    // get_color_for_track() ile AYNI 20 renklik sabit palet — her track_id
+    // HER ZAMAN ayni renkte (confidence/kaybolma durumuna gore DEGIL, RGA
+    // metin cizemedigi icin ID rozeti yerine renk kararliligi kullanilir).
+    // ByteTracker::update() zaten SADECE aktif (Tracked) track'leri
+    // dondurdugu icin (bkz. ByteTracker.hpp), burada "kaybolan" durumu YOK —
+    // liste ne veriyorsa o cizilir, kaybolan nesne bir SONRAKI karede
+    // listede hic olmadigi icin ANINDA cizimden duser.
     // frame: RgaPreprocessor::cloneFrame() cikisi (decode buffer'ina DEGIL,
     //        bagimsiz kopyaya cizilmeli).
     static void drawTrackedObjects(const DmaBufferPtr& frame,
-                                    const std::vector<TrackableObject>& objects,
+                                    const std::vector<TrackedBox>& objects,
                                     int line_thickness = 4);
 
 private:

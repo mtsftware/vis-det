@@ -1,6 +1,6 @@
 #include "postprocess/YoloPostProcessor.hpp"
 
-#include "tracking/MultiObjectTracker.hpp"
+#include "tracking/ByteTracker.hpp"
 
 #include "im2d.h"
 #include "rga.h"
@@ -236,18 +236,26 @@ int toRgaFormat(PixelFormat fmt) {
     }
 }
 
-// Referans: tracking-app main_m11_test.cpp colorForConfidence() ile ayni
-// esik/renk semasi (kirmizi/turuncu/yesil), artik takip durumuna gore.
-int colorForTrack(float confidence, bool lost) {
-    constexpr float kGreenThresh = 0.7f;
-    constexpr float kOrangeThresh = 0.4f;
-    if (lost || confidence <= kOrangeThresh) {
-        return (255 << 16) | (0 << 8) | 0;  // kirmizi — kaybolan/dusuk guven
-    }
-    if (confidence <= kGreenThresh) {
-        return (255 << 16) | (165 << 8) | 0;  // turuncu — orta guven
-    }
-    return (0 << 16) | (255 << 8) | 0;  // yesil — yuksek guven
+// Referans: edge-ai-workshop-rknn/overlay.py _TRACK_COLORS ile AYNI 20
+// renklik palet (Python tuple'lari cv2 konvansiyonuyla (B,G,R) — burada
+// (R,G,B)'ye cevrilip RGA'nin (R<<16)|(G<<8)|B paketleme sirasina uyarlandi).
+// get_color_for_track(): track_id % palet_boyu — her track HER ZAMAN ayni
+// renk (confidence/kaybolma durumuna GORE DEGIL).
+struct Rgb { uint8_t r, g, b; };
+constexpr Rgb kTrackPalette[] = {
+    {56, 56, 255},   {151, 157, 255}, {31, 112, 255},  {29, 178, 255},
+    {49, 210, 207},  {10, 249, 72},   {23, 204, 146},  {134, 219, 61},
+    {52, 147, 26},   {187, 212, 0},   {168, 153, 44},  {255, 194, 0},
+    {147, 69, 52},   {255, 115, 100}, {236, 24, 0},    {255, 56, 132},
+    {133, 0, 82},    {255, 56, 203},  {200, 149, 255}, {199, 55, 255},
+};
+constexpr int kTrackPaletteSize = sizeof(kTrackPalette) / sizeof(kTrackPalette[0]);
+
+int colorForTrackId(int track_id) {
+    int idx = track_id % kTrackPaletteSize;
+    if (idx < 0) idx += kTrackPaletteSize;
+    const Rgb& c = kTrackPalette[idx];
+    return (static_cast<int>(c.r) << 16) | (static_cast<int>(c.g) << 8) | static_cast<int>(c.b);
 }
 
 im_rect alignRectEven(im_rect r) {
@@ -263,10 +271,12 @@ im_rect alignRectEven(im_rect r) {
 }  // namespace
 
 // Referans: tracking-app main_m11_test.cpp drawBboxOutline() ile AYNI teknik
-// (RGA imfillArray, 4 ince kenar rect'i, 2-hizali). Referans tek hedef
-// ciziyordu; burada MOT icin TUM aktif track'ler donguyle cizilir.
+// (RGA imfillArray, 4 ince kenar rect'i, 2-hizali). ByteTracker::update()
+// sadece aktif track'leri dondurdugu icin buradaki liste = cizilecek liste;
+// kaybolan nesne bir onceki karede listede yer almadigi icin ZATEN cizilmez
+// (bekletme/soluklastirma YOK — kullanicinin "aninda kaybolsun" istegi).
 void YoloPostProcessor::drawTrackedObjects(const DmaBufferPtr& frame,
-                                            const std::vector<TrackableObject>& objects,
+                                            const std::vector<TrackedBox>& objects,
                                             int line_thickness) {
     if (!frame || frame->fd < 0 || objects.empty()) return;
 
@@ -280,19 +290,16 @@ void YoloPostProcessor::drawTrackedObjects(const DmaBufferPtr& frame,
     static bool logged_error = false;
 
     for (const auto& obj : objects) {
-        if (!obj.active) continue;
-
-        int x0 = std::max(0, static_cast<int>(obj.detection.x));
-        int y0 = std::max(0, static_cast<int>(obj.detection.y));
-        int x1 = std::min(fw, static_cast<int>(obj.detection.x + obj.detection.width));
-        int y1 = std::min(fh, static_cast<int>(obj.detection.y + obj.detection.height));
+        int x0 = std::max(0, static_cast<int>(obj.x));
+        int y0 = std::max(0, static_cast<int>(obj.y));
+        int x1 = std::min(fw, static_cast<int>(obj.x + obj.width));
+        int y1 = std::min(fh, static_cast<int>(obj.y + obj.height));
         if (x1 <= x0 || y1 <= y0) continue;
 
         int t = std::min(line_thickness, std::min(x1 - x0, y1 - y0) / 2);
         if (t < 1) t = 1;
 
-        bool lost = obj.lost_count > 0;
-        int color = colorForTrack(obj.detection.confidence, lost);
+        int color = colorForTrackId(obj.track_id);
 
         im_rect rects[4] = {
             alignRectEven(im_rect{x0, y0, x1 - x0, t}),

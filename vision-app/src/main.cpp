@@ -88,12 +88,12 @@ int main(int argc, char* argv[]) {
                       << result.tracked_objects.size() << " aktif track";
             const auto& labels = orchestrator.labels();
             for (const auto& obj : result.tracked_objects) {
-                int cls = obj.detection.class_id;
-                std::cout << " [#" << obj.id << " "
+                int cls = obj.class_id;
+                std::cout << " [#" << obj.track_id << " "
                           << (cls >= 0 && static_cast<size_t>(cls) < labels.size()
                                   ? labels[static_cast<size_t>(cls)]
                                   : std::to_string(cls))
-                          << " " << obj.detection.confidence << "]";
+                          << " " << obj.confidence << "]";
             }
             std::cout << "\n";
         }
@@ -108,12 +108,35 @@ int main(int argc, char* argv[]) {
     std::cout << "[main] Pipeline baslatildi. Cikmak icin Ctrl+C basin.\n";
     std::cout << "[main] Yayin: rtsp://<board-ip>:8557/out\n";
 
+    // Performans ozet dongusu: 1 saniyede bir decode/end-to-end FPS'i
+    // frames_decoded/frames_processed'in ONCEKI olcumden bu yana artisindan
+    // hesaplar (kesin gecen sureye bolerek — sleep_for'un tam 1000ms
+    // surmemesi olasiligina karsi wall-clock kullanilir).
+    uint64_t prev_decoded = 0;
+    uint64_t prev_processed = 0;
+    auto prev_t = std::chrono::steady_clock::now();
+
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
 
         auto stats = orchestrator.getStats();
+        auto now_t = std::chrono::steady_clock::now();
+        double elapsed_s = std::chrono::duration<double>(now_t - prev_t).count();
+        if (elapsed_s < 1e-3) elapsed_s = 1e-3;
+
+        double decode_fps = static_cast<double>(stats.frames_decoded - prev_decoded) / elapsed_s;
+        double end_to_end_fps =
+            static_cast<double>(stats.frames_processed - prev_processed) / elapsed_s;
+
+        prev_decoded = stats.frames_decoded;
+        prev_processed = stats.frames_processed;
+        prev_t = now_t;
+
         std::cout << "[main] decode=" << stats.frames_decoded
+                  << " (" << stats.decode_ms << "ms, " << decode_fps << " fps)"
+                  << " inference=" << stats.inference_ms << "ms"
                   << " islenen=" << stats.frames_processed
+                  << " (end-to-end " << end_to_end_fps << " fps)"
                   << " dusen(bayat)=" << stats.frames_dropped
                   << " aktif_track=" << stats.active_tracks
                   << " kaybolan=" << stats.lost_tracks << "\n";

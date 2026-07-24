@@ -52,7 +52,7 @@ struct PipelineOrchestrator::Impl {
 
     YoloInferenceEngine yolo;
     RgaPreprocessor rga;
-    MultiObjectTracker tracker;
+    ByteTracker tracker;
 
     std::unique_ptr<RtspDemuxer> demuxer;
     std::unique_ptr<MppDecoder> decoder;
@@ -74,6 +74,7 @@ struct PipelineOrchestrator::Impl {
 
     std::atomic<uint64_t> frames_processed{0};
     std::atomic<uint64_t> frames_dropped{0};
+    std::atomic<uint64_t> last_inference_us{0};  // yolo.run()+fetchOutputs() wall-clock
     uint64_t frame_index = 0;  // sadece isleme thread'i dokunur
 
     std::vector<std::string> labels;  // coco_labels.txt, start()'ta yuklenir
@@ -136,7 +137,10 @@ struct PipelineOrchestrator::Impl {
                 dumpRgbDebugPpm(rgb_model, "/tmp/vision_app_debug_input.ppm");
             }
 
-            // ADIM 2: YOLO inference (NPU)
+            // ADIM 2: YOLO inference (NPU) — run()+fetchOutputs() wall-clock
+            // olcumu (main.cpp'nin periyodik ozet satiri icin, Stats::inference_ms).
+            auto infer_t0 = std::chrono::steady_clock::now();
+
             uint32_t input_size = static_cast<uint32_t>(rgb_model->size);
             if (!yolo.run(rgb_model->virt_addr, input_size)) {
                 std::cerr << "[PipelineOrchestrator] YOLO inference basarisiz\n";
@@ -149,6 +153,13 @@ struct PipelineOrchestrator::Impl {
                 yolo.releaseOutputs();
                 continue;
             }
+
+            auto infer_t1 = std::chrono::steady_clock::now();
+            last_inference_us.store(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::microseconds>(infer_t1 - infer_t0)
+                        .count()),
+                std::memory_order_relaxed);
 
             std::vector<YoloDetection> detections;
             float max_score = -1.0f;
@@ -169,8 +180,10 @@ struct PipelineOrchestrator::Impl {
             }
             yolo.releaseOutputs();
 
-            // ADIM 4: multi-object tracking
-            auto tracked_objects = tracker.update(detections, static_cast<int>(frame_index));
+            // ADIM 4: ByteTrack — kaybolan track SADECE bir sonraki update()
+            // cagrisinda ciktidan duser (bkz. ByteTracker.hpp), ekstra bir
+            // "lost_count/max_lost_frames" bekletme mantigina GEREK YOK.
+            auto tracked_objects = tracker.update(detections);
 
             // ADIM 5: clone + dogrudan YUV uzerine cizim (RGB round-trip yok)
             DmaBufferPtr draw_frame;
@@ -224,10 +237,9 @@ bool PipelineOrchestrator::start() {
         return false;
     }
 
-    MultiObjectTracker::Config tcfg;
-    tcfg.iou_thresh = 0.4f;
-    tcfg.max_lost_frames = 10;
-    impl_->tracker.setConfig(tcfg);
+    // ByteTracker'in kendi config'i tepe-duzey ByteTrackConfig namespace'inde
+    // (bkz. include/tracking/ByteTracker.hpp) — burada ayrica setConfig
+    // cagrisina gerek yok.
 
     impl_->demuxer.reset(new RtspDemuxer(impl_->config.rtsp_url, impl_->config.rtsp_latency_ms));
     impl_->decoder.reset(new MppDecoder(impl_->config.coding));
@@ -283,13 +295,16 @@ void PipelineOrchestrator::stop() {
 PipelineOrchestrator::Stats PipelineOrchestrator::getStats() const {
     Stats s;
     if (impl_->decoder) {
-        s.frames_decoded = impl_->decoder->getStats().frames_decoded;
+        auto dstats = impl_->decoder->getStats();
+        s.frames_decoded = dstats.frames_decoded;
+        s.decode_ms = dstats.last_decode_ms;
     }
     s.frames_processed = impl_->frames_processed.load(std::memory_order_relaxed);
     s.frames_dropped = impl_->frames_dropped.load(std::memory_order_relaxed);
     s.active_tracks = static_cast<uint32_t>(impl_->tracker.activeCount());
     s.total_tracked = static_cast<uint32_t>(impl_->tracker.totalTracked());
     s.lost_tracks = static_cast<uint32_t>(impl_->tracker.lostCount());
+    s.inference_ms = static_cast<double>(impl_->last_inference_us.load(std::memory_order_relaxed)) / 1000.0;
     return s;
 }
 

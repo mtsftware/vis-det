@@ -1,6 +1,6 @@
 #pragma once
 
-#include "tracking/MultiObjectTracker.hpp"
+#include "tracking/ByteTracker.hpp"
 #include "types/DmaBuffer.hpp"
 #include "types/VideoCoding.hpp"
 
@@ -25,9 +25,9 @@
 // sadece en-yeni-kareyi bir slota bırakıp döner, ağır iş ayrı thread'de.
 //
 // Farklar (tracking-app'e göre): ITracker yerine YOLOv8n detection + NMS +
-// MultiObjectTracker; ITracker RGA/RKNN detaylarını gizliyordu, burada
-// çizim de (postprocess'in bir parçası, önceki faz kararı) aynı thread'de
-// — ResultCallback SADECE streamer.pushFrame() gibi hafif bir iş yapmalı.
+// ByteTracker; ITracker RGA/RKNN detaylarını gizliyordu, burada çizim de
+// (postprocess'in bir parçası, önceki faz kararı) aynı thread'de —
+// ResultCallback SADECE streamer.pushFrame() gibi hafif bir iş yapmalı.
 struct PipelineConfig {
     std::string rtsp_url;
     uint32_t rtsp_latency_ms = 5000;
@@ -45,7 +45,7 @@ struct PipelineConfig {
 
 struct FrameResult {
     DmaBufferPtr frame;  // cizim TAMAMLANMIS, stream'e hazir (NV12/NV16)
-    std::vector<TrackableObject> tracked_objects;
+    std::vector<TrackedBox> tracked_objects;
     int detection_count = 0;
     uint64_t frame_index = 0;
 };
@@ -76,6 +76,10 @@ public:
         uint32_t active_tracks = 0;
         uint32_t total_tracked = 0;
         uint32_t lost_tracks = 0;
+
+        // Performans metrikleri (main.cpp'nin periyodik ozet satirinda basmasi icin):
+        double decode_ms = 0.0;       // MppDecoder::Stats::last_decode_ms (bkz. oradaki not)
+        double inference_ms = 0.0;    // son yolo.run()+fetchOutputs() wall-clock suresi
     };
     Stats getStats() const;
 
