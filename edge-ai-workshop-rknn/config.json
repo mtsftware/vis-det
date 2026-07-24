@@ -1,0 +1,49 @@
+{
+  "camera": {
+    "source": "ipcom",
+    "use_gstreamer": false,
+    "remote_url": "rtsp://192.168.5.14:8554/main.264",
+    "width": 1920,
+    "height": 1080,
+    "fps": 60
+  },
+  "model": {
+    "path": "yolov8n_int8.rknn",
+    "labels_path": "coco_labels.txt",
+    "format": "rknn",
+    "use_npu": true
+  },
+  "inference": {
+    "confidence_threshold": 0.5,
+    "iou_threshold": 0.45,
+    "max_detections": 100
+  },
+  "streaming": {
+    "host": "0.0.0.0",
+    "port": 5001,
+    "jpeg_quality": 75
+  },
+  "overlay": {
+    "box_thickness": 2,
+    "font_scale": 0.6,
+    "show_confidence": true,
+    "show_fps": true
+  },
+  "actions": {
+    "enable_logging": true,
+    "log_file": "detections.csv",
+    "alert_classes": [
+      "person",
+      "car"
+    ],
+    "alert_min_confidence": 0.7
+  },
+  "tracking": {
+    "enabled": true,
+    "frame_rate": 30,
+    "track_buffer": 30,
+    "track_thresh": 0.3,
+    "high_thresh": 0.5,
+    "match_thresh": 0.8
+  }
+}
