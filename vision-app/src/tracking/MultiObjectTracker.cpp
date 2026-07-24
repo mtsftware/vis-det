@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <unordered_set>
 #include <vector>
 
 MultiObjectTracker::MultiObjectTracker() = default;
@@ -17,18 +18,14 @@ std::vector<TrackableObject> MultiObjectTracker::update(
 
     frame_counter_++;
 
-    // === ADIM 1: Eski objeleri tahmin et (constant velocity model) ===
+    // === ADIM 1: Eski objeler icin hareket tahmini (constant velocity) ===
+    // NOT: lost_count burada ARTIRILMAZ/SILINMEZ — bu karede eslesip
+    // eslesmedigi ADIM 2'den SONRA belli olur (bkz. ADIM 2.5). Eskiden
+    // burada "lost_count>0 ise artir" vardi ama hicbir yer lost_count'u
+    // ilk kez 1 yapmiyordu — sonuc: eslesmeyen objeler ASLA suresi dolup
+    // silinmiyordu, ekrandan cikan nesnenin kutusu sonsuza dek kaliyordu.
     for (auto& [id, obj] : objects_) {
         if (!obj.active) continue;
-
-        if (obj.lost_count > 0) {
-            obj.lost_count++;
-            if (obj.lost_count > cfg_.max_lost_frames) {
-                obj.active = false;
-                lost_objects_++;
-                continue;
-            }
-        }
 
         // Constant velocity tahmini: son hareketi devam ettir
         if (obj.last_seen_frame < frame_index - 1 && obj.lost_count == 0) {
@@ -91,6 +88,21 @@ std::vector<TrackableObject> MultiObjectTracker::update(
             obj.pred_y = det.y + det.height / 2.0f;
             matched_detection[&det - detections.data()] = true;
             matched_track_ids.push_back(best_id);
+        }
+    }
+
+    // === ADIM 2.5: Bu karede eslesmeyen aktif objelerin lost_count'unu
+    // artir; esik asilirsa sil. Eslesen objeler ADIM 2'de zaten lost_count=0
+    // yapildi, burada dokunulmaz.
+    std::unordered_set<int> matched_ids(matched_track_ids.begin(), matched_track_ids.end());
+    for (auto& [id, obj] : objects_) {
+        if (!obj.active) continue;
+        if (matched_ids.count(id)) continue;
+
+        obj.lost_count++;
+        if (obj.lost_count > cfg_.max_lost_frames) {
+            obj.active = false;
+            lost_objects_++;
         }
     }
 
