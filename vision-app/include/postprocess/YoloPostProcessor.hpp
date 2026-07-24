@@ -1,14 +1,21 @@
 #pragma once
 
+#include "rga_processing/RgaPreprocessor.hpp"
+#include "types/DmaBuffer.hpp"
+
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
-// YOLOv8n post-process ve NMS (Non-Max Suppression).
-// Model cikti: (1, 5, 8400) → channel 0-3: box, channel 4: score (tek-class model)
-// Cikti 640x640 piksel uzayinda — orijinal frame'e map edilmeli.
+// YOLOv8n post-process, DIoU-NMS ve MOT çizimi.
+// Model cikti: (1, 5, 8400) → channel 0-3: box, channel 4: score (tek-class,
+// verification/read.md'de dogrulandi — skor kanali grafik icinde zaten
+// Sigmoid'den gecmis, burada tekrar sigmoid UYGULANMAZ).
+// Cikti 640x640 letterbox uzayinda — orijinal frame'e LetterboxResult ile
+// (düz stretch/scale DEĞİL) map edilir; bkz. RgaPreprocessor::process().
 
 struct YoloDetection {
-    float x = 0;       // top-left x
+    float x = 0;       // top-left x (orijinal frame piksel uzayi)
     float y = 0;       // top-left y
     float width = 0;   // box width
     float height = 0;  // box height
@@ -16,6 +23,11 @@ struct YoloDetection {
     int class_id = 0;
     int track_id = -1;  // tracker tarafindan atanir
 };
+
+// Forward declare: MultiObjectTracker.hpp bu header'i (YoloDetection icin)
+// include ediyor, dongusel include'dan kacinmak icin tam tanim yerine ileri
+// bildirim yeterli (drawTrackedObjects sadece imza icin kullaniyor).
+struct TrackableObject;
 
 class YoloPostProcessor {
 public:
@@ -25,23 +37,38 @@ public:
     // Model raw output'unu detection list'ine decode eder.
     //
     // raw_output: float32[1×5×8400] (want_float=1 ile RKNN'den gelen)
-    // raw_size: bayut boyutu (normalde 1*5*8400*4 = 168000)
-    // orig_w/orig_h: orijinal frame boyutlari (640x640 degil,decode'dan gelen gercek boyut)
-    // model_w/model_h: model input boyutlari (genellikle 640x640)
-    // conf_thresh: minimum gven esigi (0.0~1.0)
+    // raw_size: bayt boyutu (normalde 1*5*8400*4 = 168000)
+    // orig_w/orig_h: orijinal frame boyutlari (decode'dan gelen gercek boyut)
+    // letterbox: RgaPreprocessor::process()'in urettigi ters-map bilgisi
+    //            (ratio + dst_offset_x/y) — model 640x640 letterbox
+    //            uzayindaki kutuyu orijinal kareye dogru geri tasir.
+    // conf_thresh: minimum guven esigi (0.0~1.0)
     //
-    // Donus: confidence esigi uzerindeki tum tespiti liste
+    // Donus: confidence esigi uzerindeki tum tespitlerin listesi
     static bool decodeOutputs(const void* raw_output, uint32_t raw_size,
                               int orig_w, int orig_h,
-                              int model_w, int model_h,
+                              const LetterboxResult& letterbox,
                               float conf_thresh,
                               std::vector<YoloDetection>& detections);
 
-    // DIOU-NMS: birlşikmiş overlap olan bbox'ları filtreler.
-    // DIOU (Intersection over Union) — boyut değişimine robust.
-    // iou_thresh: eşik (0.45~0.7 arası önerilir)
+    // DIoU-NMS: birbiriyle örtüşen bbox'ları filtreler.
+    // DIoU (Distance-IoU) — merkez mesafesini de cezalandirir, plain IoU'dan
+    // daha kararli (özellikle yakin/örtüşen çoklu nesnelerde).
+    // iou_thresh: esik (0.45~0.7 arasi onerilir)
     static std::vector<YoloDetection> applyNMS(std::vector<YoloDetection>& detections,
                                                  float iou_thresh = 0.45f);
+
+    // Referans: tracking-app main_m11_test.cpp drawBboxOutline() ile AYNI
+    // teknik (RGA imfillArray, 4 ince dikdortgen kenar, 2-hizali rect'ler) —
+    // RGB donusumune GEREK YOK, dogrudan decode'un native formatinda (NV12/
+    // NV16) frame uzerine cizer. Tek fark: referans TEK hedef ciziyordu,
+    // burada TÜM aktif track'ler (MOT) donguyle cizilir, renk track_id'ye
+    // gore degisir (kaybolan track'ler kirmizi/soluk).
+    // frame: RgaPreprocessor::cloneFrame() cikisi (decode buffer'ina DEGIL,
+    //        bagimsiz kopyaya cizilmeli).
+    static void drawTrackedObjects(const DmaBufferPtr& frame,
+                                    const std::vector<TrackableObject>& objects,
+                                    int line_thickness = 4);
 
 private:
     // Box alanı hesapla
@@ -49,7 +76,7 @@ private:
         return d.width * d.height;
     }
 
-    // DIOU (Dynamic IoU) hesaplama
+    // DIoU (Distance-IoU) hesaplama
     inline static float calculateDiou(const YoloDetection& a, const YoloDetection& b) {
         // Intersection alanı
         float x1 = std::max(a.x, b.x);
@@ -64,7 +91,7 @@ private:
 
         float iou = intersection / union_area;
 
-        // DIOU: center distance normalized by diagonal length
+        // DIoU: center distance normalized by diagonal length
         float cx1 = a.x + a.width / 2.0f;
         float cy1 = a.y + a.height / 2.0f;
         float cx2 = b.x + b.width / 2.0f;

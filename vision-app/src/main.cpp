@@ -91,9 +91,12 @@ int main(int argc, char* argv[]) {
     std::cout << "[main] Streamer basarili (NV12/NV16).\n";
 
     RgaPreprocessor rga;
-
-    // Helper: align16
-    auto align16 = [](uint32_t v) { return ((v + 15) / 16) * 16; };
+    // Referans: tracking-app RgaPreprocessor::configure() ile ayni kalip —
+    // hedef 640x640 RGB888 (YOLO NHWC girdisi), bir kez configure edilir.
+    if (!rga.configure(model_w, model_h, RgaPixelFormat::RGB888)) {
+        std::cerr << "[main] RgaPreprocessor configure basarisiz.\n";
+        return 1;
+    }
 
     // ==================== FRAME ISLEME CALLBACK ====================
     decoder.setFrameCallback([&](DmaBufferPtr decoded_frame) {
@@ -117,27 +120,19 @@ int main(int argc, char* argv[]) {
 
         std::lock_guard<std::mutex> lock(g_frame_mutex);
 
-        // ================================================================
-        // ADIM 1: Decode cikti → RGA ile 640x640 RGB (inference icin)
-        // ================================================================
-        size_t rgb_model_size = static_cast<size_t>(model_w) * model_h * 3;
-        DmaBufferPtr rgb_model = rga.acquireOutputBuffer(
-            rgb_model_size, model_w, model_h, PixelFormat::RGB888);
-        if (!rgb_model) {
-            std::cerr << "[main] RGB model buffer tahsisi basarisiz.\n";
-            return;
-        }
+        RgaPixelFormat src_rga_fmt = (detected_format == PixelFormat::NV16)
+                                          ? RgaPixelFormat::NV16
+                                          : RgaPixelFormat::NV12;
 
-        bool converted;
-        if (detected_format == PixelFormat::NV16) {
-            converted = rga.nv16ToRgb888(decoded_frame, original_width, original_height,
-                                         rgb_model, model_w, model_h);
-        } else {
-            converted = rga.nv12ToRgb888(decoded_frame, original_width, original_height,
-                                         rgb_model, model_w, model_h);
-        }
-        if (!converted) {
-            std::cerr << "[main] YUV->RGB donusum basarisiz.\n";
+        // ================================================================
+        // ADIM 1: Decode cikti → RGA letterbox ile 640x640 RGB (inference icin)
+        // Referans: RgaPreprocessor::process() (tracking-app ile ayni kalip),
+        // aspect-ratio korunur, geri-map icin LetterboxResult donduru.
+        // ================================================================
+        DmaBufferPtr rgb_model;
+        LetterboxResult letterbox;
+        if (!rga.process(decoded_frame, src_rga_fmt, rgb_model, letterbox)) {
+            std::cerr << "[main] Letterbox preprocess basarisiz.\n";
             return;
         }
 
@@ -162,21 +157,13 @@ int main(int argc, char* argv[]) {
         }
 
         std::vector<YoloDetection> detections;
-        
-        // Debug: output bilgisi
-        std::cout << "[main] Output size: " << output_size 
-                  << " bytes, raw_output: " << (raw_output ? "valid" : "NULL") << "\n";
-        
-        // Threshold geçici olarak 0.1'e düşürüldü (test amaçlı — model çok düşük skor veriyor olabilir)
-        const float detection_conf_thresh = 0.1f;
-        
+        const float detection_conf_thresh = 0.4f;
+
         YoloPostProcessor::decodeOutputs(
             raw_output, output_size,
             original_width, original_height,
-            model_w, model_h,
+            letterbox,
             detection_conf_thresh, detections);
-
-        std::cout << "[main] decodeOutputs sonra: " << detections.size() << " detection.\n";
 
         if (!detections.empty()) {
             detections = YoloPostProcessor::applyNMS(detections, 0.45f);
@@ -200,74 +187,21 @@ int main(int argc, char* argv[]) {
         }
 
         // ================================================================
-        // ADIM 5: Islenmis frame olustur (clone → RGB → draw → NV12)
+        // ADIM 5: Islenmis frame olustur (clone → cizim dogrudan YUV uzerinde)
+        // Referans: tracking-app drawBboxOutline() ile ayni teknik — RGB
+        // donusumune GEREK YOK, RGA native NV12/NV16 uzerine dogrudan cizer.
         // ================================================================
-        // Decoder cikti sınırlı havuzdan geliyor — yerinde çizim yapmayýÝ BIR.
-        // Ayri bir kopya olustur.
-        DmaBufferPtr working_copy;
-        if (!rga.cloneFrame(decoded_frame,
-                            (detected_format == PixelFormat::NV16) ? RgaPixelFormat::NV16
-                                                                    : RgaPixelFormat::NV12,
-                            working_copy)) {
+        DmaBufferPtr draw_frame;
+        if (!rga.cloneFrame(decoded_frame, src_rga_fmt, draw_frame)) {
             std::cerr << "[main] Frame clone basarisiz.\n";
             return;
         }
 
-        // Working copy'i RGB'ye çevir (çizim için)
-        uint32_t orig_aligned_w = align16(original_width);
-        uint32_t orig_aligned_h = align16(original_height);
-        size_t yuv_size;
-        if (detected_format == PixelFormat::NV16) {
-            yuv_size = static_cast<size_t>(orig_aligned_w) * orig_aligned_h * 2;
-        } else {
-            yuv_size = static_cast<size_t>(orig_aligned_w) * orig_aligned_h * 3 / 2;
+        if (!tracked_objects.empty()) {
+            YoloPostProcessor::drawTrackedObjects(draw_frame, tracked_objects, 4);
         }
 
-        DmaBufferPtr rgb_work = rga.acquireOutputBuffer(
-            static_cast<uint32_t>(yuv_size), orig_aligned_w, orig_aligned_h,
-            (detected_format == PixelFormat::NV16) ? PixelFormat::NV16 : PixelFormat::NV12);
-
-        // Working NV12 → RGB (büyük boyutta)
-        DmaBufferPtr rgb_large = rga.acquireOutputBuffer(
-            static_cast<uint32_t>(orig_aligned_w * orig_aligned_h * 3),
-            orig_aligned_w, orig_aligned_h, PixelFormat::RGB888);
-
-        bool ok;
-        if (detected_format == PixelFormat::NV16) {
-            ok = rga.nv16ToRgb888(working_copy, orig_aligned_w, orig_aligned_h,
-                                  rgb_large, orig_aligned_w, orig_aligned_h);
-        } else {
-            ok = rga.nv12ToRgb888(working_copy, orig_aligned_w, orig_aligned_h,
-                                  rgb_large, orig_aligned_w, orig_aligned_h);
-        }
-
-        if (ok) {
-            // Tespit edilen object'leri çiz
-            if (!tracked_objects.empty()) {
-                rga.drawDetectedObjects(rgb_large, orig_aligned_w, orig_aligned_h,
-                                       tracked_objects, 2, true);
-            }
-
-            // RGB → NV12 geri dönüştür (encoder için)
-            DmaBufferPtr yuv_processed = rga.acquireOutputBuffer(
-                static_cast<uint32_t>(yuv_size), orig_aligned_w, orig_aligned_h,
-                detected_format);
-
-            if (yuv_processed) {
-                bool back_converted;
-                if (detected_format == PixelFormat::NV16) {
-                    back_converted = rga.rgb888ToNv16(rgb_large, orig_aligned_w, orig_aligned_h,
-                                                       yuv_processed, orig_aligned_w, orig_aligned_h);
-                } else {
-                    back_converted = rga.rgb888ToNv12(rgb_large, orig_aligned_w, orig_aligned_h,
-                                                       yuv_processed, orig_aligned_w, orig_aligned_h);
-                }
-
-                if (back_converted) {
-                    streamer.pushFrame(yuv_processed);
-                }
-            }
-        }
+        streamer.pushFrame(draw_frame);
 
         if ((cnt+1) % 100 == 0) {
             std::cout << "[main] " << (cnt+1) << " islenmis frame stream'e gonderildi.\n";

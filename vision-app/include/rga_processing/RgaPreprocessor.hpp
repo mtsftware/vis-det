@@ -2,15 +2,31 @@
 
 #include "buffer/DmaBufferPool.hpp"
 #include "types/DmaBuffer.hpp"
-#include "tracking/MultiObjectTracker.hpp"
 
 #include <cstdint>
 #include <memory>
-#include <string>
-#include <vector>
 
-// RGA katmanina ozgu piksel format enum (referans tracking-app ile ayni)
+// Referans: tracking-app/include/preprocess/RgaPreprocessor.hpp ile BİREBİR
+// AYNI kalıp. Tek fark: tracking-app'teki cropTargetCentric() (siamese
+// tracker search-region kırpması) ve flipHorizontal() (template augmentasyonu)
+// burada YOK — YOLOv8n detector tam kareyi letterbox ile 640x640'a resize
+// eder, hedef-merkezli kırpmaya ihtiyaç duymaz.
+//
+// KRİTİK MİMARİ KURALLAR (referansla aynı, Rapor 2/3):
+// - immakeBorder() KESİNLİKLE KULLANILMAZ (RGA2 + DMA32/IOMMU çökme riski).
+// - Letterbox iki RGA çağrısıyla kurulur: imfill (gri zemin, 114/114/114 —
+//   YOLO'nun standart letterbox pad rengi) + improcess (ölçekle, ortala).
+// - Kaynak formatı (NV12/NV16/...) ASLA varsayılmaz — decode'dan gelen
+//   gerçek format çağırana açıkça parametre olarak verilir.
 enum class RgaPixelFormat { NV12, NV16, RGB888, BGR888 };
+
+struct LetterboxResult {
+    double ratio = 1.0;
+    int dst_offset_x = 0;
+    int dst_offset_y = 0;
+    int scaled_width = 0;
+    int scaled_height = 0;
+};
 
 class RgaPreprocessor {
 public:
@@ -20,59 +36,27 @@ public:
     RgaPreprocessor(const RgaPreprocessor&) = delete;
     RgaPreprocessor& operator=(const RgaPreprocessor&) = delete;
 
-    // NV12 (src) -> RGB888 (dst) dönüşüm (format + scale bir işlemte)
-    bool nv12ToRgb888(const DmaBufferPtr& src_nv12, uint32_t src_w, uint32_t src_h,
-                      DmaBufferPtr& dst_rgb, uint32_t dst_w, uint32_t dst_h);
+    // target_format: RGB888 -> YOLO model girdisi (NHWC RGB, verification/read.md).
+    bool configure(uint32_t target_width, uint32_t target_height,
+                   RgaPixelFormat target_format);
 
-    // NV16 (src) -> RGB888 (dst) dönüşüm (format + scale bir işlemte)
-    bool nv16ToRgb888(const DmaBufferPtr& src_nv16, uint32_t src_w, uint32_t src_h,
-                      DmaBufferPtr& dst_rgb, uint32_t dst_w, uint32_t dst_h);
+    // Kaynağı (MPP decode çıktısı, NV12/NV16) aspect-ratio KORUYARAK
+    // letterbox ile hedef boyuta (varsayılan 640x640) sığdırır. out_transform,
+    // postprocess'in bbox'ları orijinal kareye geri map etmesi için gereken
+    // ratio/offset bilgisini taşır (YoloPostProcessor::decodeOutputs bunu
+    // kullanır — düz stretch/scale_x-scale_y YERİNE).
+    bool process(const DmaBufferPtr& source, RgaPixelFormat source_format,
+                 DmaBufferPtr& out_buffer, LetterboxResult& out_transform);
 
-    // Otomatik format algılama: NV12 veya NV16 input kabul eder, RGB888 output verir
-    bool processYuvToRgb888(const DmaBufferPtr& src_yuv, PixelFormat src_fmt,
-                            uint32_t src_w, uint32_t src_h,
-                            DmaBufferPtr& dst_rgb, uint32_t dst_w, uint32_t dst_h);
-
-    // RGB888 buffer uzerine 3 adet dummy BBox cizer (kirmizi/yesil/mavi).
-    bool draw3DummyBboxes(DmaBufferPtr& rgb_buffer, uint32_t w, uint32_t h);
-
-    // Tespit edilen object'leri class-bazli renklerle cizer + ID etiketi ekler.
-    // renkler: insan=yeþil(0,255,0), araç=mavi(255,0,0) varsayýlýr.
-    // line_thickness: çizgi kalýnlýðý (piksel).
-    // draw_id_label: true ise bbox üzerine ID yaz (basit text rectangle).
-    bool drawDetectedObjects(DmaBufferPtr& rgb_buffer, uint32_t w, uint32_t h,
-                             const std::vector<TrackableObject>& objects,
-                             int line_thickness = 2,
-                             bool draw_id_label = true);
-
-    // RGB888 -> NV12 dönüşüm + resize (encoder icin geri çevrim)
-    bool rgb888ToNv12(const DmaBufferPtr& src_rgb, uint32_t src_w, uint32_t src_h,
-                      DmaBufferPtr& dst_nv12, uint32_t dst_w, uint32_t dst_h);
-
-    // RGB888 -> NV16 dönüşüm + resize (encoder icin geri çevrim)
-    bool rgb888ToNv16(const DmaBufferPtr& src_rgb, uint32_t src_w, uint32_t src_h,
-                      DmaBufferPtr& dst_nv16, uint32_t dst_w, uint32_t dst_h);
-
-    // Otomatik format algılama: RGB888 input kabul eder, NV12 veya NV16 output verir
-    bool processRgb888ToYuv(const DmaBufferPtr& src_rgb, uint32_t src_w, uint32_t src_h,
-                            PixelFormat dst_fmt,
-                            DmaBufferPtr& dst_yuv, uint32_t dst_w, uint32_t dst_h);
-
-    // RGB888 buffer'i diske PPM3 (renkli) olarak kaydeder
-    static bool saveRgb888ToPpm(const DmaBufferPtr& rgb_buffer, const std::string& path,
-                                 uint32_t w, uint32_t h);
-
-    // RGA ciktisi icin havuzdan buffer tahsisi (DMA fd ile)
-    DmaBufferPtr acquireOutputBuffer(uint32_t bytes, uint32_t w, uint32_t h,
-                                      PixelFormat px_fmt);
-
-    // Kaynak buffer'in tamamen ayri bir kopyasini olusturur.
-    // Decoder buffer'ina yerinde yazma (çizim vb.) onlemek icin kullanilir.
-    // pikselkaymasi.md §3 Adimlar ile uyumlu implementasyon.
+    // Kaynakla AYNI boyut/format'ta, havuzdan alınmış YENİ bir tampona
+    // donanımsal (RGA improcess) piksel kopyası. Decode çıktısına yerinde
+    // çizim yapmamak için (main'de çizim hedefi budur) — referanstaki
+    // aynı gerekçe (bkz. tracking-app RgaPreprocessor.hpp cloneFrame notu).
     bool cloneFrame(const DmaBufferPtr& source, RgaPixelFormat source_format,
-                    DmaBufferPtr& out_buffer);
+                     DmaBufferPtr& out_buffer);
+
+    struct Impl;
 
 private:
-    struct Impl;
     std::unique_ptr<Impl> impl_;
 };
