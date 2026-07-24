@@ -3,15 +3,58 @@
 #include "im2d.h"
 #include "rga.h"
 
+#include <algorithm>
 #include <cstring>
-#include <fstream>
 #include <iostream>
-#include <sstream>
+#include <string>
 
+// Referans: tracking-app/src/preprocess/RgaPreprocessor.cpp ile BİREBİR AYNI
+// kalıp (configure/process/cloneFrame + Impl::acquireBuffer havuz deseni).
+// cropTargetCentric()/flipHorizontal() (siamese tracker'a özgü) yok — bkz.
+// header notu.
+
+namespace {
+
+int toRgaFormat(RgaPixelFormat fmt) {
+    switch (fmt) {
+        case RgaPixelFormat::NV12:
+            return RK_FORMAT_YCbCr_420_SP;
+        case RgaPixelFormat::NV16:
+            return RK_FORMAT_YCbCr_422_SP;
+        case RgaPixelFormat::RGB888:
+            return RK_FORMAT_RGB_888;
+        case RgaPixelFormat::BGR888:
+            return RK_FORMAT_BGR_888;
+    }
+    return RK_FORMAT_YCbCr_420_SP;
+}
+
+size_t formatByteSize(RgaPixelFormat fmt, uint32_t w, uint32_t h) {
+    switch (fmt) {
+        case RgaPixelFormat::NV12:
+            return static_cast<size_t>(w) * h * 3 / 2;
+        case RgaPixelFormat::NV16:
+            return static_cast<size_t>(w) * h * 2;
+        case RgaPixelFormat::RGB888:
+        case RgaPixelFormat::BGR888:
+            return static_cast<size_t>(w) * h * 3;
+    }
+    return static_cast<size_t>(w) * h * 3 / 2;
+}
+
+}  // namespace
+
+// Havuz yönetimi referansla aynı: RgaPreprocessor kendi buffer'ını TAHSİS
+// ETMEZ, DmaBufferPool'dan ödünç alır; iade shared_ptr referans sayısı
+// sıfıra inince otomatik (custom deleter, bkz. 04-IBufferPool.md).
 struct RgaPreprocessor::Impl {
+    uint32_t target_width = 0;
+    uint32_t target_height = 0;
+    RgaPixelFormat target_format = RgaPixelFormat::RGB888;
+    bool configured = false;
+
     DmaBufferPool pool;
 
-    // Havuzdan buffer al (RGA ciktisi icin)
     DmaBufferPtr acquireBuffer(const char* tag, size_t bytes, uint32_t w, uint32_t h,
                                 PixelFormat px_fmt) {
         std::string name = std::string(tag) + std::to_string(bytes);
@@ -21,7 +64,8 @@ struct RgaPreprocessor::Impl {
         }
         DmaBufferPtr buf = pool.tryAcquireFor(name, 500);
         if (!buf) {
-            std::cerr << "[RgaPreprocessor] havuz zaman aşımı: " << name << "\n";
+            std::cerr << "[RgaPreprocessor] havuz zaman aşımı (" << name
+                      << ") — tüketici buffer'ları iade etmiyor olabilir\n";
             return nullptr;
         }
         buf->width = w;
@@ -37,339 +81,130 @@ struct RgaPreprocessor::Impl {
 RgaPreprocessor::RgaPreprocessor() : impl_(std::make_unique<Impl>()) {}
 RgaPreprocessor::~RgaPreprocessor() = default;
 
-DmaBufferPtr RgaPreprocessor::acquireOutputBuffer(uint32_t bytes, uint32_t w, uint32_t h,
-                                                   PixelFormat px_fmt) {
-    return impl_->acquireBuffer("out-", bytes, w, h, px_fmt);
-}
+bool RgaPreprocessor::configure(uint32_t target_width, uint32_t target_height,
+                                 RgaPixelFormat target_format) {
+    // 16-byte hizalama kuralı (Rapor 2 & 3): RGA3 üzerinden RGB/YUV
+    // çıktılarda genişlik hizası zorunlu.
+    impl_->target_width = ((target_width + 15) / 16) * 16;
+    impl_->target_height = target_height;
+    impl_->target_format = target_format;
+    impl_->configured = true;
 
-namespace {
-
-static uint32_t align16(uint32_t v) {
-    return ((v + 15) / 16) * 16;
-}
-
-static int toRgaFormat(RgaPixelFormat fmt) {
-    switch (fmt) {
-        case RgaPixelFormat::NV12:
-            return RK_FORMAT_YCbCr_420_SP;
-        case RgaPixelFormat::NV16:
-            return RK_FORMAT_YCbCr_422_SP;
-        case RgaPixelFormat::RGB888:
-            return RK_FORMAT_RGB_888;
-        case RgaPixelFormat::BGR888:
-            return RK_FORMAT_BGR_888;
+    if (impl_->target_width != target_width) {
+        std::cout << "[RgaPreprocessor] Genişlik " << target_width << " -> "
+                  << impl_->target_width << " olarak 16-byte hizalandı.\n";
     }
-    return RK_FORMAT_YCbCr_420_SP;
+    return true;
 }
 
-static size_t formatByteSize(RgaPixelFormat fmt, uint32_t w, uint32_t h) {
-    switch (fmt) {
-        case RgaPixelFormat::NV12:
-            return static_cast<size_t>(w) * h * 3 / 2;
-        case RgaPixelFormat::NV16:
-            return static_cast<size_t>(w) * h * 2;
-        case RgaPixelFormat::RGB888:
-        case RgaPixelFormat::BGR888:
-            return static_cast<size_t>(w) * h * 3;
+bool RgaPreprocessor::process(const DmaBufferPtr& source, RgaPixelFormat source_format,
+                               DmaBufferPtr& out_buffer, LetterboxResult& out_transform) {
+    if (!impl_->configured || !source || source->fd < 0) {
+        return false;
     }
-    return static_cast<size_t>(w) * h * 3 / 2;
-}
 
-}  // namespace
+    const uint32_t tw = impl_->target_width;
+    const uint32_t th = impl_->target_height;
 
-bool RgaPreprocessor::nv12ToRgb888(const DmaBufferPtr& src_nv12, uint32_t src_w,
-                                    uint32_t src_h, DmaBufferPtr& dst_rgb,
-                                    uint32_t dst_w, uint32_t dst_h) {
-    return processYuvToRgb888(src_nv12, PixelFormat::NV12, src_w, src_h, dst_rgb, dst_w, dst_h);
-}
+    // Letterbox oranı: aspect-ratio korunarak hedefe sığdırma (Rapor 3) —
+    // YOLOv8n'in eğitildiği letterbox preprocessing'iyle AYNI mantık.
+    double ratio = std::min(static_cast<double>(tw) / source->width,
+                             static_cast<double>(th) / source->height);
+    int scaled_w = static_cast<int>(source->width * ratio);
+    int scaled_h = static_cast<int>(source->height * ratio);
+    int offset_x = (static_cast<int>(tw) - scaled_w) / 2;
+    int offset_y = (static_cast<int>(th) - scaled_h) / 2;
 
-bool RgaPreprocessor::nv16ToRgb888(const DmaBufferPtr& src_nv16, uint32_t src_w,
-                                    uint32_t src_h, DmaBufferPtr& dst_rgb,
-                                    uint32_t dst_w, uint32_t dst_h) {
-    return processYuvToRgb888(src_nv16, PixelFormat::NV16, src_w, src_h, dst_rgb, dst_w, dst_h);
-}
+    out_transform.ratio = ratio;
+    out_transform.dst_offset_x = offset_x;
+    out_transform.dst_offset_y = offset_y;
+    out_transform.scaled_width = scaled_w;
+    out_transform.scaled_height = scaled_h;
 
-bool RgaPreprocessor::processYuvToRgb888(const DmaBufferPtr& src_yuv, PixelFormat src_fmt,
-                                          uint32_t src_w, uint32_t src_h,
-                                          DmaBufferPtr& dst_rgb, uint32_t dst_w, uint32_t dst_h) {
-    if (!src_yuv || src_yuv->fd < 0 || !dst_rgb) return false;
+    size_t dst_size = formatByteSize(impl_->target_format, tw, th);
+    PixelFormat out_px = (impl_->target_format == RgaPixelFormat::NV12)
+                              ? PixelFormat::NV12
+                              : PixelFormat::RGB888;
+    DmaBufferPtr buf = impl_->acquireBuffer("letterbox-", dst_size, tw, th, out_px);
+    if (!buf) return false;
 
-    int src_rga_fmt;
-    if (src_fmt == PixelFormat::NV16) {
-        src_rga_fmt = RK_FORMAT_YCbCr_422_SP;  // NV16
-    } else {
-        src_rga_fmt = RK_FORMAT_YCbCr_420_SP;  // NV12
+    int src_rga_fmt = toRgaFormat(source_format);
+    int dst_rga_fmt = toRgaFormat(impl_->target_format);
+
+    rga_buffer_t src_buf =
+        wrapbuffer_fd(source->fd, static_cast<int>(source->width),
+                      static_cast<int>(source->height), src_rga_fmt,
+                      static_cast<int>(source->w_stride),
+                      static_cast<int>(source->h_stride));
+    rga_buffer_t dst_buf = wrapbuffer_fd(buf->fd, static_cast<int>(tw),
+                                          static_cast<int>(th), dst_rga_fmt);
+
+    im_rect full_dst_rect = {0, 0, static_cast<int>(tw), static_cast<int>(th)};
+    im_rect src_rect = {0, 0, static_cast<int>(source->width),
+                         static_cast<int>(source->height)};
+    im_rect dst_rect = {offset_x, offset_y, scaled_w, scaled_h};
+
+    // ADIM 1: Zemini gri ile doldur (114,114,114 — YOLO letterbox pad rengi;
+    // immakeBorder KESİNLİKLE KULLANILMAZ, bkz. header notu).
+    int gray_color = (114 << 16) | (114 << 8) | 114;
+    IM_STATUS fill_ret = imfill(dst_buf, full_dst_rect, gray_color);
+    if (fill_ret != IM_STATUS_SUCCESS) {
+        std::cerr << "[RgaPreprocessor] imfill başarısız: " << imStrError(fill_ret)
+                  << "\n";
     }
-    int dst_rga_fmt = RK_FORMAT_RGB_888;
 
-    rga_buffer_t src_buf = wrapbuffer_fd(src_yuv->fd, static_cast<int>(src_w),
-                                          static_cast<int>(src_h), src_rga_fmt,
-                                          static_cast<int>(src_yuv->w_stride),
-                                          static_cast<int>(src_yuv->h_stride));
-
-    uint32_t dst_stride = align16(dst_w);
-    uint32_t dst_h_stride = align16(dst_h);  // Height hizalama (RK3588 chroma padding)
-    rga_buffer_t dst_buf = wrapbuffer_fd(dst_rgb->fd, static_cast<int>(dst_w),
-                                          static_cast<int>(dst_h), dst_rga_fmt,
-                                          static_cast<int>(dst_stride),
-                                          static_cast<int>(dst_h_stride));
-
-    im_rect src_rect = {0, 0, static_cast<int>(src_w), static_cast<int>(src_h)};
-    im_rect dst_rect = {0, 0, static_cast<int>(dst_w), static_cast<int>(dst_h)};
+    // ADIM 2: Kaynağı ölçekle, format dönüştür, merkeze yerleştir.
+    rga_buffer_t empty_pat{};
+    im_rect empty_rect{};
 
     IM_STATUS check_ret = imcheck(src_buf, dst_buf, src_rect, dst_rect);
     if (check_ret != IM_STATUS_NOERROR) {
-        std::cerr << "[RgaPreprocessor] processYuvToRgb888 imcheck basarisiz ("
-                  << (src_fmt == PixelFormat::NV16 ? "NV16" : "NV12")
-                  << "): " << imStrError(check_ret) << "\n";
-        return false;
+        std::cerr << "[RgaPreprocessor] imcheck başarısız: " << imStrError(check_ret)
+                  << "\n";
+        return false;  // buf otomatik havuza döner (RAII)
     }
 
-    rga_buffer_t empty_pat{};
-    im_rect empty_rect{};
-    IM_STATUS proc_ret = improcess(src_buf, dst_buf, empty_pat, src_rect, dst_rect,
-                                    empty_rect, 0);
+    IM_STATUS proc_ret =
+        improcess(src_buf, dst_buf, empty_pat, src_rect, dst_rect, empty_rect, 0);
     if (proc_ret != IM_STATUS_SUCCESS) {
-        std::cerr << "[RgaPreprocessor] processYuvToRgb888 improcess basarisiz: "
-                  << imStrError(proc_ret) << "\n";
+        std::cerr << "[RgaPreprocessor] improcess başarısız: " << imStrError(proc_ret)
+                  << "\n";
         return false;
     }
 
-    impl_->pool.syncCpuReadBegin(dst_rgb);
+    // CPU okuyacaksa (rknn_inputs_set) cache invalidate gerekli.
+    impl_->pool.syncCpuReadBegin(buf);
 
-    const char* fmt_name = (src_fmt == PixelFormat::NV16) ? "NV16" : "NV12";
-    std::cout << "[RgaPreprocessor] " << fmt_name << "->RGB888 donusum tamamlandi: "
-              << src_w << "x" << src_h << " -> " << dst_w << "x" << dst_h << "\n";
-    return true;
-}
-
-bool RgaPreprocessor::draw3DummyBboxes(DmaBufferPtr& rgb_buffer, uint32_t w, uint32_t h) {
-    if (!rgb_buffer || rgb_buffer->fd < 0) return false;
-
-    int rga_fmt = RK_FORMAT_RGB_888;
-    uint32_t stride = align16(w);
-
-    rga_buffer_t img_buf = wrapbuffer_fd(rgb_buffer->fd, static_cast<int>(w),
-                                          static_cast<int>(h), rga_fmt,
-                                          static_cast<int>(stride), static_cast<int>(h));
-
-    struct {
-        int x, y, width, height;
-        int color;
-    } bboxes[] = {
-        {10, 10, 100, 80, (255 << 16) | (0 << 8) | 0},  // Kirmizi
-        {static_cast<int>(w/2) - 50, static_cast<int>(h/2) - 40, 100, 80,
-         (0 << 16) | (255 << 8) | 0},                    // Yesil
-        {static_cast<int>(w) - 120, static_cast<int>(h) - 100, 100, 80,
-         (0 << 16) | (0 << 8) | 255},                    // Mavi
-    };
-
-    int line_thickness = 2;
-    for (const auto& bbox : bboxes) {
-        im_rect top_rect = {bbox.x, bbox.y, bbox.width, line_thickness};
-        imfill(img_buf, top_rect, bbox.color);
-        im_rect bottom_rect = {bbox.x, bbox.y + bbox.height - line_thickness,
-                               bbox.width, line_thickness};
-        imfill(img_buf, bottom_rect, bbox.color);
-        im_rect left_rect = {bbox.x, bbox.y, line_thickness, bbox.height};
-        imfill(img_buf, left_rect, bbox.color);
-        im_rect right_rect = {bbox.x + bbox.width - line_thickness, bbox.y,
-                              line_thickness, bbox.height};
-        imfill(img_buf, right_rect, bbox.color);
-    }
-
-    std::cout << "[RgaPreprocessor] 3 adet dummy BBox cizildi.\n";
-    return true;
-}
-
-bool RgaPreprocessor::drawDetectedObjects(DmaBufferPtr& rgb_buffer, uint32_t w, uint32_t h,
-                                           const std::vector<TrackableObject>& objects,
-                                           int line_thickness, bool draw_id_label) {
-    if (!rgb_buffer || rgb_buffer->fd < 0 || objects.empty()) return true;
-
-    int rga_fmt = RK_FORMAT_RGB_888;
-    uint32_t stride = align16(w);
-
-    rga_buffer_t img_buf = wrapbuffer_fd(rgb_buffer->fd, static_cast<int>(w),
-                                          static_cast<int>(h), rga_fmt,
-                                          static_cast<int>(stride), static_cast<int>(h));
-
-    int count = 0;
-    for (const auto& obj : objects) {
-        if (!obj.active && obj.lost_count > 0) continue;  // tamamen silinmiþ
-
-        // Tek-class model: Tüm tespitler class 0 → yeþil renk
-        // RGA RGB888 formatinda: (B<<16)|(G<<8)|R
-        // Yeþil (RGB: 0,255,0) → (0<<16)|(255<<8)|0
-        int color = (0 << 16) | (255 << 8) | 0;
-
-        // Kaybolmuþ obje için translucent efekt: daha ince çizgi
-        int lt = line_thickness;
-        if (obj.lost_count > 0) {
-            lt = std::max(1, line_thickness - 1);
-            // Kaybolmuþ obje için sarý renk
-            color = (0 << 16) | (255 << 8) | 255;
-        }
-
-        float x = obj.detection.x;
-        float y = obj.detection.y;
-        float bw = obj.detection.width;
-        float bh = obj.detection.height;
-
-        // Üst kenar
-        im_rect top_rect = {static_cast<int>(x), static_cast<int>(y),
-                           static_cast<int>(bw), lt};
-        imfill(img_buf, top_rect, color);
-
-        // Alt kenar
-        im_rect bottom_rect = {static_cast<int>(x), static_cast<int>(y + bh - lt),
-                               static_cast<int>(bw), lt};
-        imfill(img_buf, bottom_rect, color);
-
-        // Sol kenar
-        im_rect left_rect = {static_cast<int>(x), static_cast<int>(y),
-                             lt, static_cast<int>(bh)};
-        imfill(img_buf, left_rect, color);
-
-        // Sað kenar
-        im_rect right_rect = {static_cast<int>(x + bw - lt), static_cast<int>(y),
-                              lt, static_cast<int>(bh)};
-        imfill(img_buf, right_rect, color);
-
-        // ID label: bbox üstüne küçük dikdörtgen + metin efekti
-        if (draw_id_label) {
-            // Label arka plan (dolu dikdörtgen)
-            int label_w = 50;
-            int label_h = 16;
-            int label_x = static_cast<int>(x);
-            int label_y = static_cast<int>(y) - label_h;
-            if (label_y < 0) label_y = static_cast<int>(y);
-
-            // Label arka plan - dolu dikdörtgen (renkli)
-            im_rect label_bg = {label_x, label_y, label_w, label_h};
-            imfill(img_buf, label_bg, color);
-
-            // Label sýrý
-            im_rect label_border = {label_x, label_y, label_w, 1};
-            imfill(img_buf, label_border, (255 << 16) | (255 << 8) | 255);
-            im_rect label_border_b = {label_x, label_y + label_h - 1, label_w, 1};
-            imfill(img_buf, label_border_b, (255 << 16) | (255 << 8) | 255);
-            im_rect label_border_l = {label_x, label_y, 1, label_h};
-            imfill(img_buf, label_border_l, (255 << 16) | (255 << 8) | 255);
-            im_rect label_border_r = {label_x + label_w - 1, label_y, 1, label_h};
-            imfill(img_buf, label_border_r, (255 << 16) | (255 << 8) | 255);
-        }
-
-        count++;
-    }
-
-    std::cout << "[RgaPreprocessor] " << count << " adet object çizildi.\n";
-    return true;
-}
-
-bool RgaPreprocessor::rgb888ToNv12(const DmaBufferPtr& src_rgb, uint32_t src_w,
-                                    uint32_t src_h, DmaBufferPtr& dst_nv12,
-                                    uint32_t dst_w, uint32_t dst_h) {
-    return processRgb888ToYuv(src_rgb, src_w, src_h, PixelFormat::NV12, dst_nv12, dst_w, dst_h);
-}
-
-bool RgaPreprocessor::rgb888ToNv16(const DmaBufferPtr& src_rgb, uint32_t src_w,
-                                    uint32_t src_h, DmaBufferPtr& dst_nv16,
-                                    uint32_t dst_w, uint32_t dst_h) {
-    return processRgb888ToYuv(src_rgb, src_w, src_h, PixelFormat::NV16, dst_nv16, dst_w, dst_h);
-}
-
-bool RgaPreprocessor::processRgb888ToYuv(const DmaBufferPtr& src_rgb, uint32_t src_w,
-                                          uint32_t src_h, PixelFormat dst_fmt,
-                                          DmaBufferPtr& dst_yuv, uint32_t dst_w, uint32_t dst_h) {
-    if (!src_rgb || src_rgb->fd < 0 || !dst_yuv) return false;
-
-    int src_rga_fmt = RK_FORMAT_RGB_888;
-    int dst_rga_fmt;
-    if (dst_fmt == PixelFormat::NV16) {
-        dst_rga_fmt = RK_FORMAT_YCbCr_422_SP;  // NV16
-    } else {
-        dst_rga_fmt = RK_FORMAT_YCbCr_420_SP;  // NV12
-    }
-
-    uint32_t src_stride = align16(src_w);
-    uint32_t dst_stride = align16(dst_w);
-    uint32_t dst_h_stride = align16(dst_h);  // Height hizalama (RK3588 chroma padding)
-
-    rga_buffer_t src_buf = wrapbuffer_fd(src_rgb->fd, static_cast<int>(src_w),
-                                          static_cast<int>(src_h), src_rga_fmt,
-                                          static_cast<int>(src_stride),
-                                          static_cast<int>(src_h));
-
-    rga_buffer_t dst_buf = wrapbuffer_fd(dst_yuv->fd, static_cast<int>(dst_w),
-                                          static_cast<int>(dst_h), dst_rga_fmt,
-                                          static_cast<int>(dst_stride),
-                                          static_cast<int>(dst_h_stride));
-
-    im_rect src_rect = {0, 0, static_cast<int>(src_w), static_cast<int>(src_h)};
-    im_rect dst_rect = {0, 0, static_cast<int>(dst_w), static_cast<int>(dst_h)};
-
-    IM_STATUS check_ret = imcheck(src_buf, dst_buf, src_rect, dst_rect);
-    if (check_ret != IM_STATUS_NOERROR) {
-        std::cerr << "[RgaPreprocessor] processRgb888ToYuv imcheck basarisiz: "
-                  << imStrError(check_ret) << "\n";
-        return false;
-    }
-
-    rga_buffer_t empty_pat{};
-    im_rect empty_rect{};
-    IM_STATUS proc_ret = improcess(src_buf, dst_buf, empty_pat, src_rect, dst_rect,
-                                    empty_rect, 0);
-    if (proc_ret != IM_STATUS_SUCCESS) {
-        std::cerr << "[RgaPreprocessor] processRgb888ToYuv improcess basarisiz: "
-                  << imStrError(proc_ret) << "\n";
-        return false;
-    }
-
-    const char* fmt_name = (dst_fmt == PixelFormat::NV16) ? "NV16" : "NV12";
-    std::cout << "[RgaPreprocessor] RGB888->" << fmt_name
-              << " donusum tamamlandi: " << src_w << "x" << src_h
-              << " -> " << dst_w << "x" << dst_h << "\n";
+    out_buffer = buf;
     return true;
 }
 
 bool RgaPreprocessor::cloneFrame(const DmaBufferPtr& source, RgaPixelFormat source_format,
                                   DmaBufferPtr& out_buffer) {
-    // pikselkaymasi.md §3 Adim 1: Ön koşul kontrolü
-    if (!source || source->fd < 0) {
-        return false;
-    }
+    if (!source || source->fd < 0) return false;
 
     uint32_t w = source->width;
     uint32_t h = source->height;
 
-    // pikselkaymasi.md §3 Adim 2: Boyut/format belirle, byte hesapla
-    // Hedef her zaman SIKI-PAKETLI (w_stride=w, h_stride=h) — dolgu payi yok
+    // Hedef her zaman SIKI-PAKETLİ (w_stride=w, h_stride=h). Kaynağın kendi
+    // stride'ı (dolgu payı olabilir) src_buf'a ayrıca veriliyor.
     size_t bytes = formatByteSize(source_format, w, h);
     PixelFormat px = (source_format == RgaPixelFormat::NV16) ? PixelFormat::NV16
                                                               : PixelFormat::NV12;
+    DmaBufferPtr buf = impl_->acquireBuffer("frame-clone-", bytes, w, h, px);
+    if (!buf) return false;
 
-    // pikselkaymasi.md §3 Adim 3: Havuzdan buffer al
-    DmaBufferPtr buf = impl_->acquireBuffer("frame-clone-", static_cast<uint32_t>(bytes), w, h, px);
-    if (!buf) {
-        return false;
-    }
-
-    // pikselkaymasi.md §3 Adim 4: RGA wrapper'larini hazirla
-    // Kaynak: gerçek stride ile, Hedef: tightly-packed (stride argümani verilmez)
     int rga_fmt = toRgaFormat(source_format);
-    rga_buffer_t src_buf = wrapbuffer_fd(source->fd, static_cast<int>(w),
-                                          static_cast<int>(h), rga_fmt,
-                                          static_cast<int>(source->w_stride),
+    rga_buffer_t src_buf = wrapbuffer_fd(source->fd, static_cast<int>(w), static_cast<int>(h),
+                                          rga_fmt, static_cast<int>(source->w_stride),
                                           static_cast<int>(source->h_stride));
     rga_buffer_t dst_buf =
         wrapbuffer_fd(buf->fd, static_cast<int>(w), static_cast<int>(h), rga_fmt);
 
-    // pikselkaymasi.md §3 Adim 5: imcheck ile dogrulama, sonra improcess ile kopyala
     im_rect rect = {0, 0, static_cast<int>(w), static_cast<int>(h)};
     IM_STATUS check_ret = imcheck(src_buf, dst_buf, rect, rect);
     if (check_ret != IM_STATUS_NOERROR) {
-        std::cerr << "[RgaPreprocessor] cloneFrame imcheck basarisiz: "
+        std::cerr << "[RgaPreprocessor] cloneFrame imcheck başarısız: "
                   << imStrError(check_ret) << "\n";
         return false;
     }
@@ -378,46 +213,16 @@ bool RgaPreprocessor::cloneFrame(const DmaBufferPtr& source, RgaPixelFormat sour
     im_rect empty_rect{};
     IM_STATUS proc_ret = improcess(src_buf, dst_buf, empty_pat, rect, rect, empty_rect, 0);
     if (proc_ret != IM_STATUS_SUCCESS) {
-        std::cerr << "[RgaPreprocessor] cloneFrame improcess basarisiz: "
+        std::cerr << "[RgaPreprocessor] cloneFrame improcess başarısız: "
                   << imStrError(proc_ret) << "\n";
         return false;
     }
 
-    // pikselkaymasi.md §3 Adim 6: Cache senkronizasyonu, sonucu döndür
+    // Çağıran (drawTrackedObjects) bu tampon üzerine RGA ile çizecek; CPU
+    // ilk kez RtspStreamer::pushFrame'in memcpy'ında dokunuyor — invalidate'i
+    // burada bir kez işaretlemek yeterli (bkz. referans aynı notu).
     impl_->pool.syncCpuReadBegin(buf);
+
     out_buffer = buf;
-    return true;
-}
-
-bool RgaPreprocessor::saveRgb888ToPpm(const DmaBufferPtr& rgb_buffer, const std::string& path,
-                                       uint32_t w, uint32_t h) {
-    if (!rgb_buffer || !rgb_buffer->virt_addr) return false;
-
-    const uint8_t* data = static_cast<const uint8_t*>(rgb_buffer->virt_addr);
-    size_t expected_size = static_cast<size_t>(w) * h * 3;
-    if (rgb_buffer->size < expected_size) {
-        std::cerr << "[RgaPreprocessor] PPM kaydetme icin buffer cok kucuk\n";
-        return false;
-    }
-
-    std::ofstream fout(path, std::ios::binary);
-    if (!fout) {
-        std::cerr << "[RgaPreprocessor] Dosya acilamadi: " << path << "\n";
-        return false;
-    }
-
-    std::ostringstream header;
-    header << "P3\n" << w << " " << h << "\n255\n";
-    fout.write(header.str().c_str(), static_cast<std::streamsize>(header.str().size()));
-
-    for (uint32_t i = 0; i < w * h; ++i) {
-        int r = data[i * 3];
-        int g = data[i * 3 + 1];
-        int b = data[i * 3 + 2];
-        fout << r << " " << g << " " << b << " ";
-    }
-    fout.close();
-
-    std::cout << "[RgaPreprocessor] Renkli goruntu kaydedildi: " << path << "\n";
     return true;
 }

@@ -32,10 +32,11 @@ set(SOURCES
     src/decode/MppDecoder.cpp
     src/inference/YoloInferenceEngine.cpp
     src/ingestion/RtspDemuxer.cpp
+    src/pipeline/PipelineOrchestrator.cpp
     src/postprocess/YoloPostProcessor.cpp
     src/rga_processing/RgaPreprocessor.cpp
     src/streaming/RtspStreamer.cpp
-    src/tracking/MultiObjectTracker.cpp
+    src/tracking/ByteTracker.cpp
 )
 
 # ========================
