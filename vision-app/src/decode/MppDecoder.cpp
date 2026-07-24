@@ -48,6 +48,7 @@ struct MppDecoder::Impl {
     std::atomic<uint64_t> frames_decoded{0};
     std::atomic<uint64_t> frames_dropped{0};
     std::atomic<uint64_t> packets_failed{0};
+    std::atomic<uint64_t> last_decode_us{0};
 
     ~Impl() { stop(); }
 
@@ -125,6 +126,7 @@ struct MppDecoder::Impl {
 
     void getFrameLoop() {
         while (running.load()) {
+            auto t0 = std::chrono::steady_clock::now();
             MppFrame frame = nullptr;
             MPP_RET ret = mpi->decode_get_frame(ctx, &frame);
 
@@ -153,6 +155,15 @@ struct MppDecoder::Impl {
                 frames_dropped.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
+
+            // decode_get_frame()'in bu BASARILI cagrisinin surdugu sure
+            // (bkz. Stats::last_decode_ms notu — ASYNC put/get mimarisi
+            // yuzunden "saf decode suresi" degil ama darbogaz teshisi icin
+            // kullanisli bir proxy).
+            auto t1 = std::chrono::steady_clock::now();
+            uint64_t us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count());
+            last_decode_us.store(us, std::memory_order_relaxed);
 
             emitFrame(frame);
         }
@@ -249,5 +260,6 @@ MppDecoder::Stats MppDecoder::getStats() const {
         impl_->frames_decoded.load(std::memory_order_relaxed),
         impl_->frames_dropped.load(std::memory_order_relaxed),
         impl_->packets_failed.load(std::memory_order_relaxed),
+        static_cast<double>(impl_->last_decode_us.load(std::memory_order_relaxed)) / 1000.0,
     };
 }

@@ -3,7 +3,6 @@
 #include "rknn_api.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -170,17 +169,15 @@ bool YoloInferenceEngine::run(const void* input_buf, uint32_t input_size) {
         return false;
     }
 
-    // NPU calistir — sure olcumu
-    auto run_start = std::chrono::steady_clock::now();
+    // NPU calistir. Sure olcumu artik burada HER KAREDE loglanmiyor (terminali
+    // bogan gurultuydu) — PipelineOrchestrator, run()+fetchOutputs()'u saran
+    // kendi wall-clock olcumunu periyodik ozet satirinda basiyor (bkz.
+    // PipelineOrchestrator::Stats::last_inference_ms).
     ret = rknn_run(impl_->ctx, nullptr);
-    auto run_end = std::chrono::steady_clock::now();
-    auto run_ms = std::chrono::duration_cast<std::chrono::milliseconds>(run_end - run_start).count();
-
     if (ret != RKNN_SUCC) {
         std::cerr << "[YoloInferenceEngine] rknn_run basarisiz, ret=" << ret << "\n";
         return false;
     }
-    std::cout << "[YoloInferenceEngine] RKNN Run suresi: " << run_ms << " ms\n";
     return true;
 }
 
